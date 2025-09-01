@@ -41,6 +41,7 @@ FRONTEND_ORIGINS = [
     "http://127.0.0.1:5173",
     # add your deployed frontend here, e.g.:
     # "https://flashlearn-frontend.onrender.com",
+     "https://aiflashcard254.netlify.app",  # ✅ deployed frontend
 ]
 
 CORS(
