@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.dist/
+build/
+.env
+.venv/
+.env.local
+# VSCode/IDE
+.vscode/
+.idea/
+# OS
+.DS_Store
+Thumbs.db
+# DB dumps
+*.pgsql
+# Pipenv / Poetry temp
+pip-log.txt
