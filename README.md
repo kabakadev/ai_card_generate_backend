@@ -337,6 +337,17 @@ flask run
 
 - **GET /user/stats** - Retrieve user statistics (🔒 Protected)
 
-## License
+For support or inquiries, feel free to reach out:
 
-This project is licensed under the [MIT License](LICENSE).
+- 📧 **Email:** [Email:](mailto:iankabaka1@gmail.com)
+ 📧 **Email:** [Email:](mailto:oumamichael108@gmail.com)
+
+## 👥 Team Members github:
+Kabakadev
+Psychedelic-313
+OumaMichael 
+
+## 📄 License
+This project is licensed under the MIT License 
+
+Built with ❤️ by the 3 Members
