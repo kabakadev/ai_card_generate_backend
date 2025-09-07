@@ -8,7 +8,7 @@ from routes.progress_routes import ProgressResource
 from routes.stats_routes import UserStatsResource
 from routes.ai_routes import AIGenerateFlashcards
 from sqlalchemy import text  # add this import at the top of app.py
-
+from routes.payments_routes import BillingCheckout, BillingStatus, IntaSendWebhook, VerifyPayment,DebugIntaSendStatus
 @app.route('/')
 def home():
     return jsonify({
@@ -59,6 +59,17 @@ api.add_resource(
     "/ai/generate-flashcards", "/ai/generate-flashcards/",
 )
 
+api.add_resource(BillingCheckout, "/billing/checkout")
+api.add_resource(BillingStatus,  "/billing/status")
+api.add_resource(VerifyPayment,  "/billing/verify")           # <-- new
+api.add_resource(IntaSendWebhook,
+    "/billing/webhooks/intasend",
+    "/billing/webhooks/intasend/"   # allow trailing slash too
+)
+  # optional for now
+api.add_resource(DebugIntaSendStatus, "/debug/intasend/status")
+
+
 @app.route('/init-db')
 def init_db():
     try:
@@ -66,6 +77,8 @@ def init_db():
         return jsonify({"message": "Database tables created successfully!"}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
 
 
 

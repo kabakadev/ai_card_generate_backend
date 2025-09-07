@@ -187,3 +187,16 @@ class AIGeneration(db.Model):
 
     user = db.relationship("User", backref=db.backref("ai_generations", lazy="dynamic"))
     deck = db.relationship("Deck", backref=db.backref("ai_generations", lazy="dynamic"))
+
+# Expose billing models from submodules (so `from models import Subscription, ...` works)
+from .billing.subscription import Subscription
+from .billing.payment_transaction import PaymentTransaction
+from .billing.usage_limits import UsageLimits
+
+__all__ = [
+    # existing public models…
+    "User", "Deck", "Flashcard", "Progress", "UserStats",
+    "Payment", "UserCredits", "AIGeneration",
+    # new billing models
+    "Subscription", "PaymentTransaction", "UsageLimits",
+]

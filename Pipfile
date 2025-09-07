@@ -23,17 +23,23 @@ flask-cors = "==4.0.0"
 flask-bcrypt = "==1.0.1"
 gunicorn = "==23.0.0"
 python-dotenv = "==1.0.1"
+
+# HF tools
 huggingface-hub = "==0.34.4"
 hf-xet = "==1.1.9"
 fsspec = "==2025.3.0"
 filelock = "==3.16.1"
 tqdm = "==4.67.1"
+
+# HTTP stack
 requests = "==2.32.4"
 urllib3 = "==2.2.3"
 charset-normalizer = "==3.4.3"
 idna = "==3.10"
 certifi = "==2025.8.3"
-pyyaml = "==6.0.2"
+
+# Time / typing / misc
+python-dateutil = "==2.9.0.post0"
 pytz = "==2025.1"
 typing-extensions = "==4.12.2"
 importlib-metadata = "==8.5.0"
@@ -45,9 +51,14 @@ pyjwt = "==2.9.0"
 packaging = "==24.2"
 six = "==1.17.0"
 zipp = "==3.20.2"
+
+# You had these; keeping unless intentional
 ps = "==0.1.0"
+
+# IntaSend SDK (aligned with our code)
+intasend-python = ">=1.0.0"
 
 [dev-packages]
 
 [requires]
-python_version = "3.8"
+python_version = "3.13"
