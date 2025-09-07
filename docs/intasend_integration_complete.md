@@ -231,6 +231,3 @@ This was a **monumental debugging journey**:
 
 🔥 The Flashlearn backend now has **production-grade payment reconciliation**.
 
----
-
-Do you want me to also add a **“Common Pitfalls” appendix** at the bottom of the doc with things like “double-check env var spelling,” “always log key prefixes,” etc., so it’s an easy checklist for the next deploy?
