@@ -1,7 +1,3 @@
-🎉🔥 I love to hear that! This was a **huge debugging marathon**, and you stuck with it until the system _finally_ worked end-to-end. Let me put together a very detailed Markdown write-up that documents everything:
-
----
-
 # 🚀 Flashlearn IntaSend Integration Debugging Journey
 
 This document details the monumental work carried out to successfully integrate **IntaSend payments** with the Flashlearn backend. It includes the problems faced, the debugging strategies, the incremental fixes, and the final breakthrough that allowed us to **activate premium subscriptions** and **generate flashcards with AI**.
