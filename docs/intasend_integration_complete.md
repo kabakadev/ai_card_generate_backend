@@ -1,3 +1,7 @@
+🎉🔥 I love to hear that! This was a **huge debugging marathon**, and you stuck with it until the system _finally_ worked end-to-end. Let me put together a very detailed Markdown write-up that documents everything:
+
+---
+
 # 🚀 Flashlearn IntaSend Integration Debugging Journey
 
 This document details the monumental work carried out to successfully integrate **IntaSend payments** with the Flashlearn backend. It includes the problems faced, the debugging strategies, the incremental fixes, and the final breakthrough that allowed us to **activate premium subscriptions** and **generate flashcards with AI**.
@@ -132,9 +136,13 @@ This allowed subsequent SDK status checks to succeed.
 With the above fixes in place:
 
 - User pays on hosted checkout.
+
 - IntaSend webhook fires with `api_ref: "TX25"`.
+
 - Our backend **resolves it to the correct transaction**, backfills `invoice_id`.
+
 - IntaSend confirms `COMPLETE`.
+
 - We call `_mark_tx_and_activate()`, which:
 
   - Marks the payment succeeded.
@@ -146,9 +154,31 @@ With the above fixes in place:
   { "subscription_status": "active" }
   ```
 
-- AI flashcard generator no longer throws `402 PAYMENT REQUIRED`.
+* AI flashcard generator no longer throws `402 PAYMENT REQUIRED`.
 
 🚀 Premium activation and flashcard generation are now seamless.
+
+---
+
+### 🙈 4.1. The “.env Typo” Gotcha
+
+After deployment to Render, checkout calls suddenly failed with vague `server_error` responses from IntaSend.
+Turns out the culprit was embarrassingly simple:
+
+- We had set the env var as:
+
+  ```
+  INTASEND_TEST_MOD
+  ```
+
+  instead of the correct:
+
+  ```
+  INTASEND_TEST_MODE
+  ```
+
+Because the SDK never saw the proper flag, it defaulted into the wrong mode and all live checkouts exploded.
+Fixing the env var spelling instantly restored sanity. 🥳
 
 ---
 
@@ -168,6 +198,9 @@ With the above fixes in place:
 
 5. **Local dev with webhooks requires ngrok discipline.**
    Always keep ngrok online, and verify webhook delivery with `/health`.
+
+6. **Double-check env vars.**
+   A single missing character can break the entire payment flow.
 
 ---
 
@@ -198,5 +231,10 @@ This was a **monumental debugging journey**:
 - We went through identifier mismatches, webhook auth, ngrok woes, and status API quirks.
 - We iteratively built tools, debug endpoints, and deep logging.
 - We finally fixed the pipeline so that payments → webhooks → subscriptions → AI features all work smoothly.
+- We even caught a **one-letter env var typo** that nearly derailed everything.
 
 🔥 The Flashlearn backend now has **production-grade payment reconciliation**.
+
+---
+
+Do you want me to also add a **“Common Pitfalls” appendix** at the bottom of the doc with things like “double-check env var spelling,” “always log key prefixes,” etc., so it’s an easy checklist for the next deploy?
