@@ -1,33 +1,26 @@
-# routes/payments_routes.py — IntaSend-aligned (drop-in), CORS + hardening
+# routes/payments_routes.py — IntaSend-aligned, global CORS, rate limits, redirect allowlist, fast verify (webhook moved out)
 from __future__ import annotations
 
 from datetime import datetime
-from time import sleep
 import logging
 import os
+from urllib.parse import urlparse
 
 from flask import request
 from flask_restful import Resource
 from flask_jwt_extended import jwt_required, get_jwt_identity
-from flask_cors import cross_origin
 
-from config import db, app
-from models import PaymentTransaction, Subscription, User
-from services.intasend_client import (
-    get_intasend_client,
-    IntaSendError,
-)
+from config import db, app, limiter
+from models import PaymentTransaction, User
+from services.intasend_client import get_intasend_client, IntaSendError
 from services.subscription_manager import activate, is_active
 from services.usage_tracker import snapshot
 
-logger = logging.getLogger(__name__)
+from flask_limiter.util import get_remote_address
+from flask_jwt_extended import verify_jwt_in_request
 
-# ---- CORS (route-level) ------------------------------------------------------
-_CORS_ARGS = dict(
-    supports_credentials=True,
-    allow_headers=["Content-Type", "Authorization"],
-    methods=["GET", "POST", "OPTIONS"],
-)
+
+logger = logging.getLogger(__name__)
 
 # ---- helpers ----------------------------------------------------------------
 
@@ -112,16 +105,50 @@ def _backfill_invoice_id_from_info(tx: PaymentTransaction, info: dict) -> bool:
         return True
     return False
 
+def _allowed_redirect(url: str | None) -> str | None:
+    """
+    Allow only hosts in ALLOWED_REDIRECT_HOSTS (comma-separated).
+    Falls back to common local/known hosts if env not set.
+    """
+    if not url:
+        return None
+    try:
+        allowed = [h.strip().lower() for h in (os.getenv("ALLOWED_REDIRECT_HOSTS","")).split(",") if h.strip()]
+        if not allowed:
+            allowed = ["aiflashcard254.netlify.app", "localhost:5173", "127.0.0.1:5173"]
+        host = urlparse(url).netloc.lower()
+        return url if host in set(allowed) else None
+    except Exception:
+        return None
+    
+def _rl_key_user_or_ip():
+    """
+    Per-user key for rate limits:
+    - If a valid JWT is present, use user id (so limits follow the account)
+    - Otherwise fall back to client IP (for unauthenticated routes)
+    """
+    try:
+        # Won't raise if missing/invalid when optional=True
+        verify_jwt_in_request(optional=True)
+        uid = get_jwt_identity()
+        if isinstance(uid, dict):
+            uid = uid.get("id")
+        if uid is not None:
+            return f"user:{uid}"
+    except Exception:
+        pass
+    return get_remote_address()
+
+
 # ---------------------------
 # Checkout
 # ---------------------------
 class BillingCheckout(Resource):
-    @cross_origin(**_CORS_ARGS)
     def options(self):
         return {}, 204
 
-    @cross_origin(**_CORS_ARGS)
     @jwt_required()
+    @limiter.limit("3 per minute; 10 per hour", key_func=_rl_key_user_or_ip, override_defaults=False)
     def post(self):
         identity = get_jwt_identity()
         user_id = _resolve_user_id(identity)
@@ -134,10 +161,10 @@ class BillingCheckout(Resource):
         body = request.get_json(silent=True) or {}
         phone = (body.get("phone_number") or body.get("phone") or "").strip() or None
 
-        redirect_url = (body.get("redirect_url") or "").strip()
+        redirect_url = _allowed_redirect((body.get("redirect_url") or "").strip())
         if not redirect_url:
             origin = (request.headers.get("Origin") or "").rstrip("/")
-            redirect_url = f"{origin}/billing/return" if origin else None
+            redirect_url = _allowed_redirect(f"{origin}/billing/return") if origin else None
 
         user = User.query.get(user_id)
         user_email = (getattr(user, "email", "") or "").strip() if user else ""
@@ -158,16 +185,15 @@ class BillingCheckout(Resource):
         db.session.commit()
 
         # 🔎 Env sanity
-        ready, dbg = _require_intasend_ready()
+        ready, _dbg = _require_intasend_ready()
         if not ready:
             tx.status = "failed"
             tx.failure_reason = "missing IntaSend keys in backend environment"
             db.session.commit()
-            logger.error("[BillingCheckout] Missing IntaSend env: %s", dbg)
+            logger.error("[BillingCheckout] Missing IntaSend env")
             return {
                 "error": "intasend_not_configured",
                 "detail": "Backend is missing INTASEND_PUBLIC_KEY / INTASEND_SECRET_KEY",
-                "debug": dbg,
             }, 500
 
         # Build client safely
@@ -178,7 +204,7 @@ class BillingCheckout(Resource):
             tx.failure_reason = f"client_init_error: {e}"
             db.session.commit()
             logger.exception("[BillingCheckout] IntaSend client init failed")
-            return {"error": "intasend_client_init_failed", "detail": str(e), "debug": dbg}, 500
+            return {"error": "intasend_client_init_failed", "detail": str(e)}, 500
 
         # Create checkout
         try:
@@ -220,10 +246,9 @@ class BillingCheckout(Resource):
         tx.status = "pending"
         db.session.commit()
 
-        # Optional: log the environment you used
-        logger.warning(
-            "[BillingCheckout] checkout_url=%s checkout_id=%s test_mode=%s api_base=%s",
-            checkout_url, checkout_id, getattr(client, "test_mode", None), getattr(client, "base_url", None)
+        logger.info(
+            "[BillingCheckout] checkout_id=%s test_mode=%s api_base=%s",
+            checkout_id, getattr(client, "test_mode", None), getattr(client, "base_url", None)
         )
 
         return {
@@ -239,12 +264,11 @@ class BillingCheckout(Resource):
 # Status (with safe auto-reconcile + invoice backfill)
 # ---------------------------
 class BillingStatus(Resource):
-    @cross_origin(**_CORS_ARGS)
     def options(self):
         return {}, 204
 
-    @cross_origin(**_CORS_ARGS)
     @jwt_required()
+    @limiter.limit("60 per minute")
     def get(self):
         identity = get_jwt_identity()
         user_id = _resolve_user_id(identity)
@@ -330,15 +354,14 @@ class BillingStatus(Resource):
 
 
 # ---------------------------
-# Verify (redirect/poll flow) — choose TX by checkout_id + invoice backfill + immediate-by-invoice retry
+# Verify (redirect/poll flow) — single quick check (no long sleep)
 # ---------------------------
 class VerifyPayment(Resource):
-    @cross_origin(**_CORS_ARGS)
     def options(self):
         return {}, 204
 
-    @cross_origin(**_CORS_ARGS)
     @jwt_required()
+    @limiter.limit("10 per minute", key_func=_rl_key_user_or_ip, override_defaults=False)
     def post(self):
         identity = get_jwt_identity()
         user_id = _resolve_user_id(identity)
@@ -351,13 +374,10 @@ class VerifyPayment(Resource):
         checkout_id = (
             body.get("checkout_id") or body.get("checkoutId") or body.get("api_ref") or body.get("id") or ""
         ).strip() or None
-        # Optional audit extras from FE
-        tracking_id = (body.get("tracking_id") or "").strip() or None
-        signature = (body.get("signature") or "").strip() or None
 
         logger.warning(
-            "VerifyPayment user_id=%s invoice_id=%s checkout_id=%s tracking=%s",
-            user_id, invoice_id, checkout_id, tracking_id
+            "VerifyPayment user_id=%s invoice_id=%s checkout_id=%s",
+            user_id, invoice_id, checkout_id
         )
 
         # ---- choose the right TX (prefer the one matching checkout_id) ----
@@ -393,211 +413,45 @@ class VerifyPayment(Resource):
 
         try:
             client = get_intasend_client()
-        except Exception as e:
-            logger.exception("[VerifyPayment] IntaSend client init failed")
-            return {"error": "intasend_client_init_failed", "detail": str(e)}, 500
-
-        # Longer backoff — ~32s total (0.5 + 1 + 2 + 4 + 8 + 16)
-        delays = [0.5, 1, 2, 4, 8, 16]
-        last_raw_state = None
-
-        for attempt, delay in enumerate(delays, 1):
-            if attempt > 1:
-                logger.info("Verify attempt %d/%d tx=%s (sleep %ss)", attempt, len(delays), tx.id, delay)
-                sleep(delay)
-
-            try:
-                info = client.check_payment_status(
-                    invoice_id=invoice_id or tx.provider_ref or None,
-                    checkout_id=checkout_id or tx.api_ref or None,
-                )
-
-                # 🔁 Backfill invoice_id if we only had checkout_id
-                discovered = _backfill_invoice_id_from_info(tx, info)
-                if discovered:
-                    invoice_id = tx.provider_ref  # use it immediately if we retry
-
-                # IntaSend exposes state either at top-level or under "invoice"
-                raw = info.get("raw") or {}
-                inv = (raw.get("invoice") or {}) if isinstance(raw, dict) else {}
-                raw_state = (inv.get("state") or info.get("state") or info.get("status"))
-                norm = _normalize_state(raw_state)
-                last_raw_state = raw_state
-                logger.warning(
-                    "[Verify] attempt=%s tx=%s state(raw)=%s norm=%s invoice_id=%s checkout_id=%s",
-                    attempt, tx.id, raw_state, norm, tx.provider_ref, tx.api_ref
-                )
-
-                # ✅ Immediate-by-invoice retry: if we just discovered invoice_id and still have no state
-                if discovered and not raw_state and tx.provider_ref:
-                    try:
-                        info2 = client.check_payment_status(invoice_id=tx.provider_ref, checkout_id=None)
-                        raw2 = info2.get("raw") or {}
-                        inv2 = (raw2.get("invoice") or {}) if isinstance(raw2, dict) else {}
-                        raw_state2 = inv2.get("state") or info2.get("state") or info2.get("status")
-                        norm2 = _normalize_state(raw_state2)
-                        logger.warning("[Verify] immediate-by-invoice retry state=%s norm=%s", raw_state2, norm2)
-                        if norm2 == "succeeded":
-                            _mark_tx_and_activate(tx, info2)
-                            active, sub = is_active(user_id)
-                            return {
-                                "status": "activated",
-                                "subscription_status": "active" if active else "inactive",
-                                "current_period_end": sub.end_date.isoformat() + "Z" if (sub and sub.end_date) else None,
-                                "attempts": attempt,
-                                "debug": {"user_id": user_id},
-                            }, 200
-                        if norm2 == "failed":
-                            tx.mark_failed(reason="verify: FAILED from IntaSend", provider_status=raw_state2)
-                            return {"status": "failed", "attempts": attempt}, 200
-                    except Exception as e:
-                        logger.warning("[Verify] immediate recheck error: %s", e)
-
-                if norm == "succeeded":
-                    _mark_tx_and_activate(tx, info)
-                    active, sub = is_active(user_id)
-                    return {
-                        "status": "activated",
-                        "subscription_status": "active" if active else "inactive",
-                        "current_period_end": sub.end_date.isoformat() + "Z" if (sub and sub.end_date) else None,
-                        "attempts": attempt,
-                        "debug": {"user_id": user_id},
-                    }, 200
-
-                if norm == "failed":
-                    tx.mark_failed(reason="verify: FAILED from IntaSend", provider_status=raw_state)
-                    return {"status": "failed", "attempts": attempt}, 200
-
-                # else still pending → continue
-
-            except Exception as e:
-                logger.warning("Verify attempt %d error: %s", attempt, e)
-                # continue; final fall-through returns pending
-
-        return {"status": "pending", "attempts": len(delays), "debug": {"last_raw_state": last_raw_state}}, 200
-
-
-# ---------------------------
-# Webhook (optional but useful) — with invoice backfill
-# ---------------------------
-# routes/payments_routes.py (replace the existing class)
-# ---------------------------
-# Webhook (robust) — match TX by: checkout_id OR invoice_id OR TX<ID> fallback
-# ---------------------------
-class IntaSendWebhook(Resource):
-    @cross_origin(**_CORS_ARGS)
-    def options(self):
-        return {}, 204
-
-    @cross_origin(**_CORS_ARGS)
-    def post(self):
-        # 1) Parse + auth (shared secret)
-        payload = request.get_json(silent=True) or {}
-        logger.info("[Webhook] received payload: %s", payload)
-
-        expected = (os.getenv("INTASEND_WEBHOOK_CHALLENGE") or "").strip()
-        got = (payload.get("challenge") or "").strip()
-        if not expected:
-            logger.warning("[Webhook] INTASEND_WEBHOOK_CHALLENGE not set in env")
-            return {"error": "server_misconfigured"}, 500
-        if got != expected:
-            logger.warning(
-                "[Webhook] challenge mismatch expected=%s got=%s",
-                (expected[:6] + "…") if expected else "",
-                (got[:6] + "…") if got else "",
+            info = client.check_payment_status(
+                invoice_id=invoice_id or tx.provider_ref or None,
+                checkout_id=checkout_id or tx.api_ref or None,
             )
-            return {"error": "unauthorized"}, 401
 
-        # 2) Extract identifiers from webhook
-        checkout_id = payload.get("checkout_id") or payload.get("id")
-        api_ref     = payload.get("api_ref") or payload.get("reference")  # IntaSend 'api_ref' you sent (e.g., "TX25")
-        invoice_id  = payload.get("invoice_id") or (payload.get("invoice") or {}).get("invoice_id")
-        raw_state   = payload.get("state") or (payload.get("invoice") or {}).get("state")
-        norm        = _normalize_state(raw_state)
+            # 🔁 Backfill invoice_id if we only had checkout_id
+            _backfill_invoice_id_from_info(tx, info)
 
-        logger.info(
-            "[Webhook] ids checkout_id=%s api_ref=%s invoice_id=%s state(raw)=%s norm=%s",
-            checkout_id, api_ref, invoice_id, raw_state, norm
-        )
+            # IntaSend exposes state either at top-level or under "invoice"
+            raw = info.get("raw") or {}
+            inv = (raw.get("invoice") or {}) if isinstance(raw, dict) else {}
+            raw_state = (inv.get("state") or info.get("state") or info.get("status"))
+            norm = _normalize_state(raw_state)
 
-        # 3) Ask IntaSend (Bearer /payment/status) for authoritative state
-        status_info = None
-        try:
-            client = get_intasend_client()
-            status_info = client.check_payment_status(
-                invoice_id=invoice_id or None,
-                checkout_id=checkout_id or None,  # harmless if it's TXxx; endpoint will ignore/404 that
-            )
+            if norm == "succeeded":
+                _mark_tx_and_activate(tx, info)
+                active, sub = is_active(user_id)
+                return {
+                    "status": "activated",
+                    "subscription_status": "active" if active else "inactive",
+                    "current_period_end": sub.end_date.isoformat() + "Z" if (sub and sub.end_date) else None,
+                    "attempts": 1,
+                }, 200
+
+            if norm == "failed":
+                tx.mark_failed(reason="verify: FAILED from IntaSend", provider_status=raw_state)
+                db.session.commit()
+                return {"status": "failed", "attempts": 1}, 200
+
         except Exception as e:
-            logger.warning("[Webhook] status check failed: %s", e)
-            status_info = {"state": raw_state}
+            logger.warning("[Verify] quick check error: %s", e)
 
-        # 4) Find local TX — try multiple strategies in order
-        tx = None
-
-        # (a) direct match by stored checkout UUID (your DB currently uses this in PaymentTransaction.api_ref)
-        if checkout_id:
-            tx = PaymentTransaction.query.filter_by(api_ref=checkout_id).first()
-
-        # (b) match by provider_ref (invoice_id) if present
-        if not tx and invoice_id:
-            tx = PaymentTransaction.query.filter_by(provider_ref=invoice_id).first()
-
-        # (c) NEW: if api_ref looks like "TX<id>", map it to the PaymentTransaction primary key
-        if not tx and api_ref:
-            api_ref_str = str(api_ref)
-            if api_ref_str.upper().startswith("TX"):
-                try:
-                    tx_id = int(api_ref_str[2:])
-                    tx = PaymentTransaction.query.get(tx_id)
-                    if tx:
-                        logger.info("[Webhook] matched TX by TX<ID> fallback: id=%s", tx_id)
-                except Exception as _:
-                    pass  # ignore parse errors
-
-        if not tx:
-            logger.warning("[Webhook] no local TX for checkout=%s api_ref=%s invoice=%s",
-                           checkout_id, api_ref, invoice_id)
-            # Accept to avoid IntaSend retry storms; FE polling/verify can still fix it.
-            return {"status": "accepted"}, 202
-
-        # If already done, exit early
-        if tx.status == "succeeded":
-            logger.info("[Webhook] tx id=%s already succeeded", tx.id)
-            return {"status": "ok"}, 200
-
-        # 5) Backfill invoice_id (critical for future status checks)
-        if status_info:
-            _backfill_invoice_id_from_info(tx, status_info)
-        elif invoice_id and not tx.provider_ref:
-            tx.provider_ref = invoice_id
-            db.session.commit()
-
-        # 6) Decide final state
-        final_raw_state = (
-            (status_info.get("invoice") or {}).get("state")
-            or (status_info or {}).get("state")
-            or raw_state
-        )
-        decided = _normalize_state(final_raw_state)
-        logger.info("[Webhook] tx=%s state=%s → %s", tx.id, final_raw_state, decided)
-
-        if decided == "succeeded":
-            _mark_tx_and_activate(tx, status_info or {})
-        elif decided == "failed":
-            tx.mark_failed(reason=str(payload)[:500])
-            db.session.commit()
-        else:
-            tx.status = "pending"
-            tx.updated_at = datetime.utcnow()
-            db.session.commit()
-
-        return {"status": "ok"}, 200
+        return {"status": "pending", "attempts": 1}, 200
 
 
-# routes/payments_routes.py  (add at bottom)
+# routes/payments_routes.py  (debug)
 class DebugIntaSendStatus(Resource):
     @jwt_required()
+    @limiter.limit("30 per minute")
     def get(self):
         checkout_id = (request.args.get("checkout_id") or "").strip()
         invoice_id = (request.args.get("invoice_id") or "").strip() or None
