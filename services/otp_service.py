@@ -1,19 +1,75 @@
 # services/otp_service.py
 from __future__ import annotations
 
-import logging, smtplib
+import logging
+import os
+import smtplib
 from email.message import EmailMessage
 from email.utils import formataddr
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from secrets import randbelow
+
+import requests
+from sqlalchemy import text
 
 from config import app, db, bcrypt
 from models.security.otp_code import OTPCode
-from flask import request  # add at top of file if not present
+from flask import request  # ensure this import exists
 
 logger = logging.getLogger(__name__)
 
+# --------------------------------------------------------------------------------------
+# Time helpers (always timezone-aware; DB uses timestamptz)
+# --------------------------------------------------------------------------------------
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+# --------------------------------------------------------------------------------------
+# Email sending: prefer HTTPS (Brevo) and fall back to SMTP only if no API key provided
+# --------------------------------------------------------------------------------------
+def _brevo_configured() -> bool:
+    return bool(os.environ.get("BREVO_API_KEY") or app.config.get("BREVO_API_KEY"))
+
+def _send_email_brevo(to_email: str, subject: str, text_body: str, html_body: str | None = None) -> bool:
+    """
+    Send via Brevo HTTPS API. Requires BREVO_API_KEY and sender identity.
+    Docs: https://developers.brevo.com/reference/sendtransacemail
+    """
+    api_key = os.environ.get("BREVO_API_KEY") or app.config.get("BREVO_API_KEY")
+    if not api_key:
+        return False
+
+    from_email = app.config.get("FROM_EMAIL") or os.environ.get("FROM_EMAIL") or "no-reply@example.com"
+    from_name = app.config.get("FROM_NAME") or os.environ.get("FROM_NAME") or "FlashLearn"
+
+    payload = {
+        "sender": {"name": from_name, "email": from_email},
+        "to": [{"email": to_email}],
+        "subject": subject,
+        "textContent": text_body,
+    }
+    if html_body:
+        payload["htmlContent"] = html_body
+
+    try:
+        r = requests.post(
+            "https://api.brevo.com/v3/smtp/email",
+            headers={
+                "api-key": api_key,
+                "accept": "application/json",
+                "content-type": "application/json",
+            },
+            json=payload,
+            timeout=15,
+        )
+        r.raise_for_status()
+        return True
+    except Exception:
+        logger.exception("Brevo send failed")
+        return False
+
 def _smtp_configured() -> bool:
+    # used only as a fallback when no BREVO_API_KEY
     return bool(app.config.get("SMTP_HOST") and app.config.get("SMTP_USER") and app.config.get("SMTP_PASSWORD"))
 
 def _send_email_smtp(to_email: str, subject: str, body: str) -> bool:
@@ -22,11 +78,11 @@ def _send_email_smtp(to_email: str, subject: str, body: str) -> bool:
     user = app.config.get("SMTP_USER")
     pw   = app.config.get("SMTP_PASSWORD")
     use_tls = bool(app.config.get("SMTP_USE_TLS", True))
-    from_addr = app.config.get("SMTP_FROM")
-    from_name = app.config.get("SMTP_FROM_NAME", "FlashLearn")
+    from_addr = app.config.get("SMTP_FROM") or app.config.get("FROM_EMAIL") or "no-reply@example.com"
+    from_name = app.config.get("SMTP_FROM_NAME", app.config.get("FROM_NAME", "FlashLearn"))
 
     if not (host and user and pw and from_addr):
-        logger.warning("SMTP not fully configured; skipping real send (dev mode).")
+        logger.warning("SMTP not fully configured; skipping real send.")
         return False
 
     msg = EmailMessage()
@@ -46,10 +102,128 @@ def _send_email_smtp(to_email: str, subject: str, body: str) -> bool:
         logger.exception("SMTP send failed")
         return False
 
+def _send_email(to_email: str, subject: str, text_body: str, html_body: str | None = None) -> bool:
+    # Prefer HTTPS API; fall back to SMTP if no API key set
+    if _brevo_configured():
+        return _send_email_brevo(to_email, subject, text_body, html_body)
+    return _send_email_smtp(to_email, subject, text_body)
+
+# --------------------------------------------------------------------------------------
+# DB compatibility: handle legacy NOT NULL `otp_codes.code` column gracefully
+# --------------------------------------------------------------------------------------
+_legacy_code_check_cache: dict[str, bool] = {}
+
+def _otp_table_requires_plain_code() -> bool:
+    """
+    Returns True if `public.otp_codes` has column `code` defined as NOT NULL.
+    We cache the result in-process to avoid repeated information_schema queries.
+    """
+    cache_key = "otp_requires_code"
+    if cache_key in _legacy_code_check_cache:
+        return _legacy_code_check_cache[cache_key]
+
+    sql = text("""
+        select is_nullable
+        from information_schema.columns
+        where table_schema = 'public'
+          and table_name = 'otp_codes'
+          and column_name = 'code'
+        limit 1
+    """)
+    try:
+        row = db.session.execute(sql).fetchone()
+        requires = bool(row and (row[0] == "NO"))  # NOT NULL
+        _legacy_code_check_cache[cache_key] = requires
+        return requires
+    except Exception:
+        # If the probe fails, assume not required (safer) and log
+        logger.exception("Failed to probe otp_codes.code nullability; assuming nullable/absent.")
+        _legacy_code_check_cache[cache_key] = False
+        return False
+
+def _insert_otp_row(
+    *,
+    user_id: int,
+    purpose: str,
+    code_plain: str,
+    code_hash: str,
+    expires_at: datetime,
+    sent_to: str,
+    ip: str,
+    user_agent: str,
+) -> int:
+    """
+    Inserts an OTP row. If legacy `code NOT NULL` exists, we include `code`
+    but we DO NOT store the real code in plaintext—store a redacted token instead.
+    Returns the new row's id.
+    """
+    needs_plain_code = _otp_table_requires_plain_code()
+
+    created_at = _now_utc()
+    attempts = 0
+    max_attempts = 5
+    consumed = False
+
+    if needs_plain_code:
+        # redacted placeholder to satisfy NOT NULL; not the actual code
+        redacted = "******"
+        sql = text("""
+            insert into public.otp_codes
+                (user_id, purpose, code, code_hash, expires_at, attempts, max_attempts, consumed, sent_to, ip, user_agent, created_at)
+            values
+                (:user_id, :purpose, :code, :code_hash, :expires_at, :attempts, :max_attempts, :consumed, :sent_to, :ip, :user_agent, :created_at)
+            returning id
+        """)
+        params = dict(
+            user_id=user_id,
+            purpose=purpose,
+            code=redacted,
+            code_hash=code_hash,
+            expires_at=expires_at,
+            attempts=attempts,
+            max_attempts=max_attempts,
+            consumed=consumed,
+            sent_to=sent_to,
+            ip=ip,
+            user_agent=user_agent,
+            created_at=created_at,
+        )
+        new_id = db.session.execute(sql, params).scalar_one()
+        db.session.commit()
+        return int(new_id)
+
+    # Modern table: use ORM (no plaintext code column required)
+    otp = OTPCode(
+        user_id=user_id,
+        purpose=purpose,
+        code_hash=code_hash,
+        expires_at=expires_at,
+        attempts=attempts,
+        max_attempts=max_attempts,
+        consumed=consumed,
+        sent_to=sent_to,
+        ip=ip,
+        user_agent=user_agent,
+        created_at=created_at,
+    )
+    db.session.add(otp)
+    db.session.commit()
+    return int(otp.id)
+
+# --------------------------------------------------------------------------------------
+# OTP core
+# --------------------------------------------------------------------------------------
 def _gen_code(n_digits: int = 6) -> str:
     return f"{randbelow(1_000_000):06d}"
 
-def issue_otp(user, email: str, minutes: int = 5, purpose: str = "login", ip: str | None = None, ua: str | None = None):
+def issue_otp(
+    user,
+    email: str,
+    minutes: int = 5,
+    purpose: str = "login",
+    ip: str | None = None,
+    ua: str | None = None,
+):
     # Invalidate any previous active codes for this user/purpose
     OTPCode.query.filter_by(user_id=user.id, purpose=purpose, consumed=False).delete()
     db.session.commit()
@@ -57,33 +231,34 @@ def issue_otp(user, email: str, minutes: int = 5, purpose: str = "login", ip: st
     code = _gen_code()
     code_hash = bcrypt.generate_password_hash(code).decode("utf-8")
 
-    otp = OTPCode(
+    otp_id = _insert_otp_row(
         user_id=user.id,
         purpose=purpose,
+        code_plain=code,
         code_hash=code_hash,
-        expires_at=datetime.utcnow() + timedelta(minutes=minutes),
-        max_attempts=5,
-        consumed=False,
+        expires_at=_now_utc() + timedelta(minutes=minutes),
         sent_to=email,
         ip=(ip or "")[:64],
         user_agent=(ua or "")[:512],
     )
-    db.session.add(otp)
-    db.session.commit()
 
     subject = "Your FlashLearn login code"
-    body = (
+    text_body = (
         f"Your FlashLearn login code is: {code}\n\n"
         f"This code expires in {minutes} minutes. If you didn’t request it, ignore this email."
     )
+    html_body = f"<p>Your FlashLearn login code is: <strong>{code}</strong></p><p>This code expires in {minutes} minutes.</p>"
 
-    sent = _send_email_smtp(email, subject, body)
+    sent = _send_email(email, subject, text_body, html_body)
 
     # Echo the code only in dev (or if you set OTP_DEV_ECHO_CODE=true)
     dev_echo = bool(app.config.get("OTP_DEV_ECHO_CODE", app.config.get("ENV", "development").lower() == "development"))
     dev_code = code if dev_echo else None
 
-    return otp, sent, dev_code
+    # Return lightweight object-shape compatible with old code
+    class _Obj:
+        def __init__(self, id_: int): self.id = id_
+    return _Obj(otp_id), sent, dev_code
 
 def verify_and_consume_otp(user, otp_id: int, code: str) -> tuple[bool, str]:
     otp = OTPCode.query.filter_by(id=otp_id, user_id=user.id, purpose="login").first()
@@ -91,8 +266,11 @@ def verify_and_consume_otp(user, otp_id: int, code: str) -> tuple[bool, str]:
         return False, "invalid_otp"
     if otp.consumed:
         return False, "already_used"
-    if datetime.utcnow() > otp.expires_at:
+
+    # timezone-safe comparison
+    if _now_utc() > otp.expires_at:
         return False, "expired"
+
     if otp.attempts >= (otp.max_attempts or 5):
         return False, "too_many_attempts"
 
@@ -115,7 +293,6 @@ def issue_login_code(user, ttl_minutes: int = 5) -> dict:
         ip=ip,
         ua=ua,
     )
-    # keep legacy return shape
     return {"otp_id": otp.id, "dev_code": dev_code, "sent": sent}
 
 def verify_login_code(user, otp_id: int, code: str) -> tuple[bool, str]:
