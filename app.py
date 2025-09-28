@@ -74,6 +74,11 @@ def register_routes():
     api.add_resource(CatalogResource, "/catalog/seed")
     api.add_resource(CatalogListResource, "/catalog")  # <-- NEW
 
+    # Reviews / SRS routes
+    from routes.reviews_routes import ReviewsNext
+    api.add_resource(ReviewsNext, "/reviews/next")
+
+
 
 def register_error_handlers():
     """Register global error handlers."""

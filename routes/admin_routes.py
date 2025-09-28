@@ -565,15 +565,16 @@ class AdminCreateDemoUsers(Resource):
             used_emails.add(email)
 
             # password handling:
+            # password handling:
             if static_password:
                 pw_plain = static_password
+                # hash ONCE and reuse (already computed above)
                 pw_hash = hashed_once
             else:
-                # per-user random demo password (fast but if you hash per-user, it’ll be slow)
+                # per-user random demo password
                 pw_plain = "".join(random.choices(string.ascii_letters + string.digits, k=12))
-                # For speed in demos, we directly assign to password_hash field.
-                # If your model hashes on property set, move to a bulk Core insert of the hash you want.
-                pw_hash = pw_plain  # <-- DEMO ONLY. If you need hashing, see notes below.
+                # hash each one (bcrypt is slower, but demo batch sizes are usually fine)
+                pw_hash = bcrypt.generate_password_hash(pw_plain).decode("utf-8")
 
             rows.append({
                 "username": u,

@@ -133,6 +133,7 @@ def _get_cors_origins():
     base_origins = [
         "http://localhost:5173",
         "http://127.0.0.1:5173",
+        "https://aiflashcard254.netlify.app",
     ]
     
     if not IS_LOCAL:

@@ -1,12 +1,14 @@
-from sqlalchemy.orm import validates
+from sqlalchemy.orm import validates, relationship
 from sqlalchemy.ext.hybrid import hybrid_property
 from sqlalchemy_serializer import SerializerMixin
-from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey
-import re
-from config import db, bcrypt
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey
 from datetime import datetime
-from sqlalchemy.orm import relationship
+import re
+
+from config import db, bcrypt
+
+_BCRYPT_RE = re.compile(r'^\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}$')
 
 class User(db.Model):
     __tablename__ = 'users'
@@ -23,49 +25,64 @@ class User(db.Model):
     created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
 
-    # PARENT-SIDE RELATIONSHIPS (single source of truth)
-    decks = db.relationship('Deck', backref='user', passive_deletes=True)
-    progress = db.relationship('Progress', backref='user', passive_deletes=True)
-    otp_codes = db.relationship("OTPCode", backref='user', passive_deletes=True)
-    trusted_devices = db.relationship("TrustedDevice", backref='user', passive_deletes=True)
-    ai_generations = db.relationship("AIGeneration", backref='user', passive_deletes=True)
-    payment_transactions = db.relationship("PaymentTransaction", backref='user', passive_deletes=True)
-    payments = db.relationship("Payment", backref='user', passive_deletes=True)
-    usage_limits = db.relationship("UsageLimits", backref='user', passive_deletes=True)
+    # relationships...
+    decks = relationship('Deck', backref='user', passive_deletes=True)
+    progress = relationship('Progress', backref='user', passive_deletes=True)
+    otp_codes = relationship("OTPCode", backref='user', passive_deletes=True)
+    trusted_devices = relationship("TrustedDevice", backref='user', passive_deletes=True)
+    ai_generations = relationship("AIGeneration", backref='user', passive_deletes=True)
+    payment_transactions = relationship("PaymentTransaction", backref='user', passive_deletes=True)
+    payments = relationship("Payment", backref='user', passive_deletes=True)
+    usage_limits = relationship("UsageLimits", backref='user', passive_deletes=True)
 
-    # One-to-one subscription
-    subscription = db.relationship(
-        "Subscription",
-        backref=db.backref("user"),
-        uselist=False,
-        passive_deletes=True
-    )
+    subscription = relationship("Subscription", backref=db.backref("user"), uselist=False, passive_deletes=True)
 
     serialize_rules = ('-decks.user', '-progress.user')
 
+    # --- password API ---
     @hybrid_property
     def password_hash(self):
         return self._password_hash
 
     @password_hash.setter
-    def password_hash(self, password):
+    def password_hash(self, password: str):
+        """Always hash when the public property is used."""
         self._password_hash = bcrypt.generate_password_hash(password).decode('utf-8')
 
-    def check_password(self, password):
-        return bcrypt.check_password_hash(self._password_hash, password)
+    @validates("_password_hash")
+    def _validate_password_hash(self, key, value):
+        """
+        Guardrail: if someone sets the private column directly (ORM path),
+        ensure it's a bcrypt string. This prevents plaintext/different formats.
+        """
+        if value is None or not _BCRYPT_RE.match(value):
+            raise ValueError("password_hash must be a bcrypt string")
+        return value
 
+    def check_password(self, password: str) -> bool:
+        """
+        Never 500 on legacy/bad hashes. If the stored value is invalid,
+        treat it as a failed login instead of crashing.
+        """
+        try:
+            return bcrypt.check_password_hash(self._password_hash, password)
+        except Exception:
+            return False
+
+    # --- other validators ---
     @validates("email")
     def validate_email(self, key, email):
         email_regex = r'^[\w\.-]+@[\w\.-]+\.\w+$'
-        if not re.match(email_regex, email):
+        if not re.match(email_regex, email or ""):
             raise ValueError("Invalid email format")
-        return email.lower()
+        return (email or "").lower()
 
     @validates("username")
     def validate_username(self, key, username):
-        if len(username) < 3 or len(username) > 50:
+        if not username or len(username) < 3 or len(username) > 50:
             raise ValueError("Username must be between 3 and 50 characters")
         return username
+
 
 class Deck(db.Model, SerializerMixin):
     __tablename__ = 'decks'
@@ -183,10 +200,12 @@ from .billing.payment_transaction import PaymentTransaction
 from .billing.usage_limits import UsageLimits
 from .security.otp_code import OTPCode
 from .security.trusted_device import TrustedDevice
+from .review import Review
+
 
 __all__ = [
     "User", "Deck", "Flashcard", "Progress", "UserStats",
     "Payment", "UserCredits", "AIGeneration",
     "Subscription", "PaymentTransaction", "UsageLimits",
-    "OTPCode", "TrustedDevice",
+    "OTPCode", "TrustedDevice","Review",
 ]
