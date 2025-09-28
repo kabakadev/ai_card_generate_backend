@@ -8,6 +8,7 @@ from email.message import EmailMessage
 from email.utils import formataddr
 from datetime import datetime, timedelta, timezone
 from secrets import randbelow
+from typing import Optional, Tuple
 
 import requests
 from sqlalchemy import text
@@ -19,10 +20,22 @@ from flask import request  # ensure this import exists
 logger = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------------------
-# Time helpers (always timezone-aware; DB uses timestamptz)
+# Time helpers (always timezone-aware; DB should use timestamptz)
 # --------------------------------------------------------------------------------------
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
+
+def _as_aware_utc(dt: Optional[datetime]) -> Optional[datetime]:
+    """
+    Coerce any datetime to timezone-aware UTC for safe comparisons.
+    Assumes naive values are already in UTC. If your DB stored local time,
+    convert accordingly before replacing tzinfo.
+    """
+    if dt is None:
+        return None
+    if dt.tzinfo is None or dt.tzinfo.utcoffset(dt) is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 # --------------------------------------------------------------------------------------
 # Email sending: prefer HTTPS (Brevo) and fall back to SMTP only if no API key provided
@@ -30,7 +43,7 @@ def _now_utc() -> datetime:
 def _brevo_configured() -> bool:
     return bool(os.environ.get("BREVO_API_KEY") or app.config.get("BREVO_API_KEY"))
 
-def _send_email_brevo(to_email: str, subject: str, text_body: str, html_body: str | None = None) -> bool:
+def _send_email_brevo(to_email: str, subject: str, text_body: str, html_body: Optional[str] = None) -> bool:
     """
     Send via Brevo HTTPS API. Requires BREVO_API_KEY and sender identity.
     Docs: https://developers.brevo.com/reference/sendtransacemail
@@ -102,7 +115,7 @@ def _send_email_smtp(to_email: str, subject: str, body: str) -> bool:
         logger.exception("SMTP send failed")
         return False
 
-def _send_email(to_email: str, subject: str, text_body: str, html_body: str | None = None) -> bool:
+def _send_email(to_email: str, subject: str, text_body: str, html_body: Optional[str] = None) -> bool:
     # Prefer HTTPS API; fall back to SMTP if no API key set
     if _brevo_configured():
         return _send_email_brevo(to_email, subject, text_body, html_body)
@@ -214,6 +227,7 @@ def _insert_otp_row(
 # OTP core
 # --------------------------------------------------------------------------------------
 def _gen_code(n_digits: int = 6) -> str:
+    # 6-digit code with leading zeros preserved
     return f"{randbelow(1_000_000):06d}"
 
 def issue_otp(
@@ -221,11 +235,11 @@ def issue_otp(
     email: str,
     minutes: int = 5,
     purpose: str = "login",
-    ip: str | None = None,
-    ua: str | None = None,
+    ip: Optional[str] = None,
+    ua: Optional[str] = None,
 ):
     # Invalidate any previous active codes for this user/purpose
-    OTPCode.query.filter_by(user_id=user.id, purpose=purpose, consumed=False).delete()
+    OTPCode.query.filter_by(user_id=user.id, purpose=purpose, consumed=False).delete(synchronize_session=False)
     db.session.commit()
 
     code = _gen_code()
@@ -257,10 +271,11 @@ def issue_otp(
 
     # Return lightweight object-shape compatible with old code
     class _Obj:
-        def __init__(self, id_: int): self.id = id_
+        def __init__(self, id_: int) -> None:
+            self.id = id_
     return _Obj(otp_id), sent, dev_code
 
-def verify_and_consume_otp(user, otp_id: int, code: str) -> tuple[bool, str]:
+def verify_and_consume_otp(user, otp_id: int, code: str) -> Tuple[bool, str]:
     otp = OTPCode.query.filter_by(id=otp_id, user_id=user.id, purpose="login").first()
     if not otp:
         return False, "invalid_otp"
@@ -268,7 +283,10 @@ def verify_and_consume_otp(user, otp_id: int, code: str) -> tuple[bool, str]:
         return False, "already_used"
 
     # timezone-safe comparison
-    if _now_utc() > otp.expires_at:
+    expires_at_utc = _as_aware_utc(otp.expires_at)
+    if expires_at_utc is None:
+        return False, "expired"
+    if _now_utc() > expires_at_utc:
         return False, "expired"
 
     if otp.attempts >= (otp.max_attempts or 5):
@@ -295,6 +313,6 @@ def issue_login_code(user, ttl_minutes: int = 5) -> dict:
     )
     return {"otp_id": otp.id, "dev_code": dev_code, "sent": sent}
 
-def verify_login_code(user, otp_id: int, code: str) -> tuple[bool, str]:
+def verify_login_code(user, otp_id: int, code: str) -> Tuple[bool, str]:
     """Legacy wrapper returning (ok, reason)."""
     return verify_and_consume_otp(user, otp_id, code)
