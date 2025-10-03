@@ -33,3 +33,7 @@ __pycache__/
 # ---- stray file ----
 =3.5
 smoke.sh
+
+# Local dev scripts
+smoke.sh
+test_admin_refactor.sh
