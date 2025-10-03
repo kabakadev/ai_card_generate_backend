@@ -49,7 +49,7 @@ def _rl_key_login_ip_combo():
 # ---------------- Resources ----------------
 class Signup(Resource):
     # Basic anti-abuse on signup (per IP)
-    @limiter.limit("20 per hour", key_func=get_remote_address, override_defaults=False)
+    @limiter.limit("200 per hour", key_func=get_remote_address, override_defaults=False)
     def post(self):
         data = request.get_json() or {}
         username = data.get("username")
@@ -81,9 +81,9 @@ class Signup(Resource):
 
 class Login(Resource):
     # Per-account hard limit (deterministic): 5/min regardless of IP
-    @limiter.limit("5 per minute", key_func=_rl_key_email, override_defaults=False)
+    @limiter.limit("50 per minute", key_func=_rl_key_email, override_defaults=False)
     # Optional additional guard: per IP+email
-    @limiter.limit("10 per minute", key_func=_rl_key_login_ip_combo, override_defaults=False)
+    @limiter.limit("100 per minute", key_func=_rl_key_login_ip_combo, override_defaults=False)
     def post(self):
         data = request.get_json() or {}
         email = (data.get("email") or "").lower()

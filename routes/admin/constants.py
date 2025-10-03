@@ -1,0 +1,51 @@
+# routes/admin/constants.py
+"""
+Constants for admin operations - centralized configuration.
+"""
+
+# User validation
+MIN_USERNAME_LENGTH = 3
+MAX_USERNAME_LENGTH = 50
+
+# Batch operation limits
+MAX_EMAILS_PER_REQUEST = 1000
+MAX_USER_IDS_PER_REQUEST = 1000
+MAX_USERNAMES_PER_CHECK = 500
+MAX_DEMO_USERS_PER_REQUEST = 500
+
+# Pagination defaults
+DEFAULT_LIST_LIMIT = 50
+MAX_LIST_LIMIT = 200
+DEFAULT_LIST_OFFSET = 0
+
+# Online user detection
+MIN_ONLINE_THRESHOLD_MINUTES = 1
+MAX_ONLINE_THRESHOLD_MINUTES = 120
+DEFAULT_ONLINE_THRESHOLD_MINUTES = 5
+MAX_ONLINE_USERS_LIMIT = 1000
+
+# Demo user defaults
+DEFAULT_DEMO_PREFIX = "demo"
+DEFAULT_DEMO_DOMAIN = "demo.flashlearn.local"
+DEFAULT_DEMO_PASSWORD_LENGTH = 12
+DEMO_USERNAME_SUFFIX_LENGTH = 6
+
+# Deletion strategies
+STRATEGY_FAST = "fast"
+STRATEGY_SLOW = "slow"
+STRATEGY_TURBO = "turbo"
+VALID_STRATEGIES = {STRATEGY_FAST, STRATEGY_SLOW, STRATEGY_TURBO}
+
+# Commit modes for slow deletion
+COMMIT_PER_USER = "user"
+COMMIT_PER_ROW = "row"
+VALID_COMMIT_MODES = {COMMIT_PER_USER, COMMIT_PER_ROW}
+
+# Rate limits (requests per minute)
+RATE_LIMIT_DELETE_USERS = "300 per minute"
+RATE_LIMIT_DELETE_BY_IDS = "500 per minute"
+RATE_LIMIT_CHECK_USERNAMES = "30 per minute"
+RATE_LIMIT_CREATE_DEMO = "10 per minute"
+RATE_LIMIT_LIST_USERS = "30 per minute"
+RATE_LIMIT_ONLINE_USERS = "190 per minute"
+RATE_LIMIT_USER_STATS = "10 per minute"

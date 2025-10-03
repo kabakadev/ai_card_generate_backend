@@ -57,17 +57,24 @@ def register_routes():
 
     # Admin routes (only if enabled)
     if app.config.get("ADMIN_ENDPOINTS_ENABLED", False):
-        from routes.admin_routes import (
-            AdminDeleteUsers, AdminCheckUsernames, AdminCreateDemoUsers,
-            AdminListUsers, AdminOnlineUsers, AdminUserStats
+        from routes.admin import (
+            AdminDeleteUsers,
+            AdminDeleteUsersByIds,
+            AdminCheckUsernames,
+            AdminCreateDemoUsers,
+            AdminListUsers,
+            AdminOnlineUsers,
+            AdminUserStats
         )
         api.add_resource(AdminDeleteUsers, "/admin/users/delete")
+        api.add_resource(AdminDeleteUsersByIds, "/admin/users/delete-by-ids")
         api.add_resource(AdminCheckUsernames, "/admin/usernames/check")
         api.add_resource(AdminCreateDemoUsers, "/admin/demo/batch_create")
         api.add_resource(AdminListUsers, "/admin/users/list")
         api.add_resource(AdminOnlineUsers, "/admin/users/online")
         api.add_resource(AdminUserStats, "/admin/users/stats")
-        logger.info("Admin routes registered")
+        logger.info("Admin routes registered (refactored)")
+
 
     # Catalog routes
     from routes.catalog_routes import CatalogResource,CatalogListResource

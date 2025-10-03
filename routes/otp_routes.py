@@ -40,8 +40,8 @@ class RequestLoginOTP(Resource):
     Send OTP to verify email for UNVERIFIED users.
     If the user is already verified, skip sending an OTP.
     """
-    @limiter.limit("3 per minute; 10 per hour", key_func=_rl_key_email, override_defaults=False)
-    @limiter.limit("10 per minute", key_func=_rl_key_email_ip_combo, override_defaults=False)
+    @limiter.limit("300 per minute; 500 per hour", key_func=_rl_key_email, override_defaults=False)
+    @limiter.limit("100 per minute", key_func=_rl_key_email_ip_combo, override_defaults=False)
     def post(self):
         data = request.get_json(silent=True) or {}
         email = (data.get("email") or "").strip().lower()
