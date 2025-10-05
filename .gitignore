@@ -37,3 +37,4 @@ __pycache__/
 # Local dev scripts
 smoke.sh
 test_admin_refactor.sh
+test_ai_refactor.sh
