@@ -3,6 +3,7 @@ from sqlalchemy.ext.hybrid import hybrid_property
 from sqlalchemy_serializer import SerializerMixin
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey
+from sqlalchemy import Enum as PgEnum, CheckConstraint, Index
 from datetime import datetime
 import re
 
@@ -24,6 +25,15 @@ class User(db.Model):
     last_seen_at = db.Column(db.DateTime, nullable=True)
     created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+    role = db.Column(
+        PgEnum('student', 'teacher', 'admin', name='user_role'),
+        nullable=False,
+        server_default='student'
+    )
+    # a demo student belongs to a teacher (the teacher is a normal users row with role='teacher')
+    teacher_id = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True)
+    disabled_at = db.Column(db.DateTime, nullable=True)
+
 
     # relationships...
     decks = relationship('Deck', backref='user', passive_deletes=True)
@@ -138,6 +148,23 @@ class Progress(db.Model, SerializerMixin):
     serialize_rules = ('-user.progress', '-deck.progress')
     __table_args__ = (db.UniqueConstraint('user_id', 'flashcard_id', name='unique_user_flashcard_progress'),)
 
+class StudentDeck(db.Model, SerializerMixin):
+    __tablename__ = 'student_decks'
+
+    student_id = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='CASCADE'), primary_key=True)
+    deck_id    = db.Column(db.Integer, db.ForeignKey('decks.id', ondelete='CASCADE'), primary_key=True)
+
+    assigned_by_user_id = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='SET NULL'), nullable=True, index=True)
+    status = db.Column(PgEnum('active', 'paused', 'archived', name='student_deck_status'), nullable=False, server_default='active')
+    assigned_at = db.Column(db.DateTime, nullable=False, server_default=db.func.current_timestamp())
+
+    # relationships (optional, for convenience)
+    student = db.relationship('User', foreign_keys=[student_id], backref=db.backref('assigned_decks', passive_deletes=True))
+    deck = db.relationship('Deck', foreign_keys=[deck_id], backref=db.backref('assigned_students', passive_deletes=True))
+    assigned_by = db.relationship('User', foreign_keys=[assigned_by_user_id])
+
+    serialize_rules = ('-student.assigned_decks', '-deck.assigned_students',)
+
 class UserStats(db.Model, SerializerMixin):
     __tablename__ = 'user_stats'
 
@@ -207,5 +234,5 @@ __all__ = [
     "User", "Deck", "Flashcard", "Progress", "UserStats",
     "Payment", "UserCredits", "AIGeneration",
     "Subscription", "PaymentTransaction", "UsageLimits",
-    "OTPCode", "TrustedDevice","Review",
+    "OTPCode", "TrustedDevice","Review","StudentDeck",
 ]

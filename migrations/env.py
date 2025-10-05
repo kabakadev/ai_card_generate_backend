@@ -73,12 +73,7 @@ def run_migrations_offline():
 
 
 def run_migrations_online():
-    """Run migrations in 'online' mode.
-
-    In this scenario we need to create an Engine
-    and associate a connection with the context.
-
-    """
+    """Run migrations in 'online' mode."""
 
     # this callback is used to prevent an auto-migration from being generated
     # when there are no changes to the schema
@@ -90,6 +85,33 @@ def run_migrations_online():
                 directives[:] = []
                 logger.info('No changes in schema detected.')
 
+    # ---------- NEW: only manage objects that exist in our models ----------
+    def include_object(object, name, type_, reflected, compare_to):
+        """
+        Allow autogenerate to operate ONLY on objects that exist
+        in our SQLAlchemy metadata (i.e., things we actually own).
+
+        Stops Alembic from dropping external/system tables like
+        flow_state, oauth_clients, sessions, etc.
+        """
+        md = get_metadata()
+
+        if type_ == "table":
+            # Only include a table if it's declared in our metadata
+            return name in md.tables
+
+        if type_ == "index":
+            # Only include an index if its parent table is managed
+            try:
+                tbl = object.table
+                return tbl is not None and tbl.name in md.tables
+            except Exception:
+                return False
+
+        # Default: include (columns, constraints) if their parent table is included
+        return True
+    # ----------------------------------------------------------------------
+
     conf_args = current_app.extensions['migrate'].configure_args
     if conf_args.get("process_revision_directives") is None:
         conf_args["process_revision_directives"] = process_revision_directives
@@ -100,14 +122,11 @@ def run_migrations_online():
         context.configure(
             connection=connection,
             target_metadata=get_metadata(),
+            include_object=include_object,          # <-- NEW
+            compare_type=True,                      # <-- recommend for pg
+            compare_server_default=True,            # <-- recommend for pg
             **conf_args
         )
 
         with context.begin_transaction():
             context.run_migrations()
-
-
-if context.is_offline_mode():
-    run_migrations_offline()
-else:
-    run_migrations_online()

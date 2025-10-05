@@ -85,6 +85,32 @@ def register_routes():
     from routes.reviews_routes import ReviewsNext
     api.add_resource(ReviewsNext, "/reviews/next")
 
+    # Teacher routes
+    from routes.teacher_routes import (
+        TeacherCreateDemoAccounts,
+        TeacherListDemoAccounts,
+        TeacherUpdateDemoAccount,
+        TeacherDisableDemoAccount,
+        TeacherExtendDemoAccount,
+        TeacherAssignDeck,
+        TeacherUnassignDeck,
+        TeacherListStudentDecks,
+        TeacherCopyDeck,
+    )
+
+    api.add_resource(TeacherCreateDemoAccounts, "/teacher/demo-accounts")
+    api.add_resource(TeacherListDemoAccounts, "/teacher/demo-accounts/list")
+    api.add_resource(TeacherUpdateDemoAccount, "/teacher/demo-accounts/<int:student_id>")
+    api.add_resource(TeacherDisableDemoAccount, "/teacher/demo-accounts/<int:student_id>/disable")
+    api.add_resource(TeacherExtendDemoAccount, "/teacher/demo-accounts/<int:student_id>/extend")
+
+    api.add_resource(TeacherAssignDeck, "/teacher/decks/<int:deck_id>/assign")
+    api.add_resource(TeacherUnassignDeck, "/teacher/decks/<int:deck_id>/unassign")
+    api.add_resource(TeacherListStudentDecks, "/teacher/students/<int:student_id>/decks")
+
+    api.add_resource(TeacherCopyDeck, "/teacher/decks/copy")
+
+
 
 
 def register_error_handlers():
