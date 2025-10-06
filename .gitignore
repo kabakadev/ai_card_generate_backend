@@ -17,3 +17,24 @@ Thumbs.db
 *.pgsql
 # Pipenv / Poetry temp
 pip-log.txt
+
+# ---- DB dumps / backups ----
+*.sql
+*.pgsql
+*.dump
+*.bak
+*.tar.zst
+supabase.backup.dump
+
+# ---- Python cache ----
+__pycache__/
+*.pyc
+
+# ---- stray file ----
+=3.5
+
+
+# Local dev scripts
+smoke.sh
+test_admin_refactor.sh
+test_ai_refactor.sh
