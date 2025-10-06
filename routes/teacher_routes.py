@@ -5,14 +5,46 @@ from typing import List
 
 from flask import request, jsonify
 from flask_restful import Resource
-from flask_jwt_extended import jwt_required, get_jwt_identity
+from flask_jwt_extended import jwt_required, get_jwt_identity,verify_jwt_in_request
 
 from config import db, limiter
 from models import User, Deck, Flashcard, StudentDeck
+from functools import wraps
 
 # ---------------------------
 # Helpers & guards
 # ---------------------------
+
+
+def require_role(role: str, *, allow_admin: bool = True):
+    """
+    Verify JWT and enforce role. By default, admins are allowed too.
+    Usage: @require_role("teacher") OR @require_role("teacher", allow_admin=False)
+    """
+    def decorator(fn):
+        @wraps(fn)
+        def wrapper(*args, **kwargs):
+            # Make sure a valid JWT is present
+            verify_jwt_in_request()
+
+            uid = get_jwt_identity()
+            user = User.query.get(uid)
+            if not user:
+                return {"error": "unauthorized"}, 401
+
+            roles_ok = {role}
+            if allow_admin:
+                roles_ok.add("admin")
+
+            if getattr(user, "role", "student") not in roles_ok:
+                return {"error": "forbidden", "message": f"{role} role required"}, 403
+
+            # attach for downstream use
+            request.current_user = user
+            return fn(*args, **kwargs)
+        return wrapper
+    return decorator
+
 
 def _now():
     return datetime.utcnow()
@@ -27,23 +59,6 @@ def _resolve_user_id(identity):
 def _get_current_user():
     uid = get_jwt_identity()
     return User.query.get(uid)
-
-def require_role(role: str):
-    """Decorator to enforce a single role (e.g., 'teacher')."""
-    def decorator(fn):
-        def wrapper(*args, **kwargs):
-            user = _get_current_user()
-            if not user:
-                return {"error": "unauthorized"}, 401
-            if user.role != role:
-                return {"error": "forbidden", "message": f"{role} role required"}, 403
-            # attach for downstream use
-            request.current_user = user
-            return fn(*args, **kwargs)
-        # preserve wrapped function attributes for Flask-RESTful (optional)
-        wrapper.__name__ = fn.__name__
-        return wrapper
-    return decorator
 
 def _json():
     return request.get_json(silent=True) or {}
@@ -83,8 +98,7 @@ class TeacherCreateDemoAccounts(Resource):
     Returns:
       { "users": [{id, username, email, password}], "count": N }
     """
-    decorators = [jwt_required(), require_role('teacher')]
-
+    decorators = [require_role("teacher")]
     def post(self):
         teacher: User = request.current_user
 
@@ -176,7 +190,7 @@ class TeacherListDemoAccounts(Resource):
     Query:
       q, page=1, per_page=20
     """
-    decorators = [jwt_required(), require_role('teacher')]
+    decorators = [require_role("teacher")]
 
     def get(self):
         teacher: User = request.current_user
@@ -220,7 +234,7 @@ class TeacherUpdateDemoAccount(Resource):
     Update limited fields on a teacher-owned demo student.
     Body: { "username"?, "password"?, "demo_expires_in_days"?, "disabled": true|false }
     """
-    decorators = [jwt_required(), require_role('teacher')]
+    decorators = [require_role("teacher")]
 
     def patch(self, student_id: int):
         teacher: User = request.current_user
@@ -276,7 +290,7 @@ class TeacherUpdateDemoAccount(Resource):
 
 class TeacherDisableDemoAccount(Resource):
     """Explicit disable endpoint (idempotent)."""
-    decorators = [jwt_required(), require_role('teacher')]
+    decorators = [require_role("teacher")]
 
     def post(self, student_id: int):
         teacher: User = request.current_user
@@ -291,7 +305,7 @@ class TeacherDisableDemoAccount(Resource):
 
 class TeacherExtendDemoAccount(Resource):
     """Extend demo expiration by N days (policy-limited, enforce caps later)."""
-    decorators = [jwt_required(), require_role('teacher')]
+    decorators = [require_role("teacher")]
 
     def post(self, student_id: int):
         teacher: User = request.current_user
@@ -316,53 +330,76 @@ class TeacherExtendDemoAccount(Resource):
 # Teacher: Deck assignment
 # ---------------------------
 
+from sqlalchemy import and_
+
 class TeacherAssignDeck(Resource):
     """
     Assign a teacher-owned deck to one or more of their demo students.
     Body: { "student_ids": [1,2,3] }
     """
-    decorators = [jwt_required(), require_role('teacher')]
+    decorators = [require_role("teacher")]
 
     def post(self, deck_id: int):
         teacher: User = request.current_user
 
+        # 1) Ensure the deck belongs to this teacher
         deck = _validate_teacher_owns_deck(teacher.id, deck_id)
         if not deck:
             return {"error": "deck_not_found"}, 404
 
+        # 2) Parse & validate body
         data = _json()
         student_ids: List[int] = data.get("student_ids") or []
         if not isinstance(student_ids, list) or not student_ids:
-            return {"error": "invalid_request", "message": "student_ids must be a non-empty list"}, 400
+            return {
+                "error": "invalid_request",
+                "message": "student_ids must be a non-empty list"
+            }, 400
 
-        # validate each student belongs to teacher
+        # Keep only distinct integers
+        try:
+            student_ids = list({int(sid) for sid in student_ids})
+        except (TypeError, ValueError):
+            return {"error": "invalid_request", "message": "student_ids must be integers"}, 400
+
+        # 3) Validate the students belong to this teacher and are demo accounts
         valid_students = db.session.query(User.id).filter(
             User.id.in_(student_ids),
             User.is_demo.is_(True),
-            User.teacher_id == teacher.id
+            User.teacher_id == teacher.id,
         ).all()
         valid_ids = {row.id for row in valid_students}
         missing = [sid for sid in student_ids if sid not in valid_ids]
         if missing:
             return {"error": "student_mismatch", "missing": missing}, 400
 
-        # upsert (unique student_id, deck_id)
-        created = 0
-        from sqlalchemy import insert
-        stmt = insert(StudentDeck.__table__).values([
-            {
+        # 4) Compute which (student_id, deck_id) pairs already exist
+        existing = db.session.query(StudentDeck.student_id).filter(
+            and_(StudentDeck.deck_id == deck.id, StudentDeck.student_id.in_(valid_ids))
+        ).all()
+        already_assigned = {row.student_id for row in existing}
+        to_insert = valid_ids - already_assigned
+
+        # 5) Bulk-insert only the missing rows
+        assigned = 0
+        if to_insert:
+            rows = [{
                 "student_id": sid,
                 "deck_id": deck.id,
                 "assigned_by_user_id": teacher.id,
-                "status": "active"
-            } for sid in valid_ids
-        ]).on_conflict_do_nothing(index_elements=["student_id", "deck_id"])
+                "status": "active",
+            } for sid in to_insert]
 
-        db.session.execute(stmt)
-        db.session.commit()
-        created = len(valid_ids)  # duplicates no-op, that’s fine
+            db.session.execute(StudentDeck.__table__.insert(), rows)
+            db.session.commit()
+            assigned = len(to_insert)
 
-        return {"assigned": created, "deck_id": deck.id, "student_ids": list(valid_ids)}, 200
+        return {
+            "assigned": assigned,
+            "already_assigned": sorted(list(already_assigned & valid_ids)),
+            "deck_id": deck.id,
+            "student_ids": sorted(list(valid_ids)),
+        }, 200
 
 
 class TeacherUnassignDeck(Resource):
@@ -370,7 +407,7 @@ class TeacherUnassignDeck(Resource):
     Unassign a deck from given demo students.
     Body: { "student_ids": [1,2,3] }
     """
-    decorators = [jwt_required(), require_role('teacher')]
+    decorators = [require_role("teacher")]
 
     def post(self, deck_id: int):
         teacher: User = request.current_user
@@ -406,7 +443,7 @@ class TeacherListStudentDecks(Resource):
     """
     View the decks assigned to a specific teacher-owned demo student.
     """
-    decorators = [jwt_required(), require_role('teacher')]
+    decorators = [require_role("teacher")]
 
     def get(self, student_id: int):
         teacher: User = request.current_user
@@ -451,7 +488,7 @@ class TeacherCopyDeck(Resource):
     into the teacher's workspace, including its flashcards.
     Body: { "source_deck_id": 123 }
     """
-    decorators = [jwt_required(), require_role('teacher')]
+    decorators = [require_role("teacher")]
 
     def post(self):
         teacher: User = request.current_user
