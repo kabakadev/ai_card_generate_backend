@@ -44,6 +44,12 @@ app.config.update({
     "JWT_HEADER_TYPE": "Bearer",
     "JWT_TOKEN_LOCATION": ["headers"],
     "RATELIMIT_HEADERS_ENABLED": True,
+    "EMAIL_PROVIDER": os.getenv("EMAIL_PROVIDER", "brevo"),
+    "BREVO_API_KEY": os.getenv("BREVO_API_KEY", ""),
+    "BREVO_SENDER_EMAIL": os.getenv("BREVO_SENDER_EMAIL"),
+    "BREVO_SENDER_NAME": os.getenv("BREVO_SENDER_NAME", "FlashLearn"),
+    "BREVO_TEMPLATE_ID": int(os.getenv("BREVO_TEMPLATE_ID", "0")),
+
 })
 
 # ---------------- Database Configuration ----------------
