@@ -64,7 +64,8 @@ def register_routes():
             AdminCreateDemoUsers,
             AdminListUsers,
             AdminOnlineUsers,
-            AdminUserStats
+            AdminUserStats,
+            AdminCreateTeacherInvite
         )
         api.add_resource(AdminDeleteUsers, "/admin/users/delete")
         api.add_resource(AdminDeleteUsersByIds, "/admin/users/delete-by-ids")
@@ -73,6 +74,7 @@ def register_routes():
         api.add_resource(AdminListUsers, "/admin/users/list")
         api.add_resource(AdminOnlineUsers, "/admin/users/online")
         api.add_resource(AdminUserStats, "/admin/users/stats")
+        api.add_resource(AdminCreateTeacherInvite, "/admin/teacher-invites")
         logger.info("Admin routes registered (refactored)")
 
 
@@ -109,6 +111,14 @@ def register_routes():
     api.add_resource(TeacherListStudentDecks, "/teacher/students/<int:student_id>/decks")
 
     api.add_resource(TeacherCopyDeck, "/teacher/decks/copy")
+
+    from routes.teacher_invites_redeem import RedeemTeacherInvite   
+    api.add_resource(RedeemTeacherInvite, "/auth/teacher/redeem")
+
+    from routes.study_routes import study_bp
+    from routes.quiz_routes import quiz_bp
+    app.register_blueprint(study_bp)
+    app.register_blueprint(quiz_bp)
 
 
 

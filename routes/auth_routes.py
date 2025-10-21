@@ -134,6 +134,7 @@ class ProtectedUser(Resource):
             "is_demo": bool(user.is_demo),
             "last_seen_at": user.last_seen_at.isoformat() if user.last_seen_at else None,
             "created_at": user.created_at.isoformat() if user.created_at else None,
+            "role": user.role,  # ← add this
         }, 200
 
 class DeleteUser(Resource):

@@ -109,6 +109,7 @@ app.config.update({
     "INTASEND_SECRET_KEY": os.getenv("INTASEND_SECRET_KEY", ""),
     "INTASEND_TEST_MODE": os.getenv("INTASEND_TEST_MODE", "true").lower() in {"1", "true", "yes", "on"},
     "BILLING_PLAN_MONTHLY_KES": int(os.getenv("BILLING_PLAN_MONTHLY_KES", "100")),
+    "BILLING_PLAN_DAILY_KES": int(os.getenv("BILLING_PLAN_DAILY_KES", "30")),
     "BILLING_CURRENCY": os.getenv("BILLING_CURRENCY", "KES"),
 })
 

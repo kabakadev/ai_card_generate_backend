@@ -8,7 +8,11 @@ from sqlalchemy.ext.hybrid import hybrid_property
 from config import db
 
 UTC = timezone.utc
-DEFAULT_PERIOD_DAYS = 30
+PLAN_PERIOD_DAYS = {
+    "daily": 1,
+    "monthly": 30,
+}
+DEFAULT_PERIOD_DAYS = PLAN_PERIOD_DAYS["monthly"]
 
 def _utcnow() -> datetime:
     return datetime.now(tz=UTC)
@@ -27,7 +31,7 @@ class Subscription(db.Model):
     )
 
     plan_type = db.Column(
-        SAEnum("monthly", name="plan_types_v1"),
+        SAEnum("daily", "monthly", name="plan_types_v1"),
         nullable=False,
         server_default="monthly",
     )
@@ -53,7 +57,7 @@ class Subscription(db.Model):
 
     @staticmethod
     def calculate_end_date(start_date: datetime, plan_type: str) -> datetime:
-        days = DEFAULT_PERIOD_DAYS if plan_type == "monthly" else DEFAULT_PERIOD_DAYS
+        days = PLAN_PERIOD_DAYS.get(plan_type, DEFAULT_PERIOD_DAYS)
         return start_date + timedelta(days=days)
 
     @hybrid_property
@@ -83,7 +87,8 @@ class Subscription(db.Model):
     def extend_one_period(self) -> None:
         now = _utcnow()
         if self.is_active and self.end_date:
-            self.end_date = self.end_date + timedelta(days=DEFAULT_PERIOD_DAYS)
+            days = PLAN_PERIOD_DAYS.get(self.plan_type, DEFAULT_PERIOD_DAYS)
+            self.end_date = self.end_date + timedelta(days=days)
         else:
             self.start_date = now
             self.end_date = self.calculate_end_date(now, self.plan_type)

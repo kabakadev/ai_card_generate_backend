@@ -44,6 +44,7 @@ class User(db.Model):
     payment_transactions = relationship("PaymentTransaction", backref='user', passive_deletes=True)
     payments = relationship("Payment", backref='user', passive_deletes=True)
     usage_limits = relationship("UsageLimits", backref='user', passive_deletes=True)
+    quizzes = relationship("Quiz", backref='user', passive_deletes=True)
 
     subscription = relationship("Subscription", backref=db.backref("user"), uselist=False, passive_deletes=True)
 
@@ -124,6 +125,7 @@ class Flashcard(db.Model, SerializerMixin):
     updated_at = db.Column(db.DateTime, server_default=db.func.current_timestamp(), onupdate=db.func.current_timestamp())
 
     progress = db.relationship('Progress', backref='flashcard', passive_deletes=True)
+    quiz_answers = db.relationship('QuizAnswer', backref='flashcard', passive_deletes=True)
 
     serialize_rules = ('-deck.flashcards','-progress.flashcard')
 
@@ -184,6 +186,113 @@ class UserStats(db.Model, SerializerMixin):
 
     serialize_rules = ('-user.stats',)
 
+class ReviewLog(db.Model, SerializerMixin):
+    """Audit trail for every individual flashcard review attempt."""
+    __tablename__ = 'review_logs'
+
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id', ondelete='CASCADE'),
+                        nullable=False, index=True)
+    flashcard_id = db.Column(db.Integer, db.ForeignKey('flashcards.id', ondelete='CASCADE'),
+                             nullable=False, index=True)
+    deck_id = db.Column(db.Integer, db.ForeignKey('decks.id', ondelete='CASCADE'),
+                        nullable=False, index=True)
+    was_correct = db.Column(db.Boolean, nullable=False)
+    time_spent_seconds = db.Column(db.Integer, default=0, nullable=False)
+    created_at = db.Column(db.DateTime, server_default=db.func.current_timestamp(),
+                           nullable=False, index=True)
+
+    serialize_rules = ('-user.review_logs', '-flashcard.review_logs', '-deck.review_logs')
+
+    __table_args__ = (
+        db.Index('ix_review_logs_user_date', 'user_id', 'created_at'),
+        db.Index('ix_review_logs_deck_user_date', 'deck_id', 'user_id', 'created_at'),
+    )
+
+class Quiz(db.Model, SerializerMixin):
+    __tablename__ = "quizzes"
+
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    quiz_type = db.Column(db.String(32), nullable=False, default="multiple_choice")
+    deck_ids = db.Column(JSONB, nullable=False, default=list)
+    total_questions = db.Column(db.Integer, nullable=False)
+    questions_answered = db.Column(db.Integer, nullable=False, default=0)
+    correct_answers = db.Column(db.Integer, nullable=False, default=0)
+    time_limit_seconds = db.Column(db.Integer, nullable=True)
+    started_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    completed_at = db.Column(db.DateTime, nullable=True)
+    status = db.Column(db.String(32), nullable=False, default="in_progress")
+
+    answers = db.relationship(
+        "QuizAnswer",
+        backref="quiz",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        order_by="QuizAnswer.question_number",
+    )
+
+    __table_args__ = (
+        db.Index("idx_quiz_user_status", "user_id", "status"),
+        db.Index("idx_quiz_created", "started_at"),
+    )
+
+    def to_dict(self) -> dict:
+        total = self.total_questions or 0
+        accuracy = round((self.correct_answers or 0) / total, 4) if total else 0.0
+        return {
+            "id": self.id,
+            "user_id": self.user_id,
+            "quiz_type": self.quiz_type,
+            "deck_ids": self.deck_ids or [],
+            "total_questions": total,
+            "questions_answered": self.questions_answered or 0,
+            "correct_answers": self.correct_answers or 0,
+            "accuracy": accuracy,
+            "time_limit_seconds": self.time_limit_seconds,
+            "started_at": self.started_at.isoformat() if self.started_at else None,
+            "completed_at": self.completed_at.isoformat() if self.completed_at else None,
+            "status": self.status,
+        }
+
+class QuizAnswer(db.Model, SerializerMixin):
+    __tablename__ = "quiz_answers"
+
+    id = db.Column(db.Integer, primary_key=True)
+    quiz_id = db.Column(db.Integer, db.ForeignKey("quizzes.id", ondelete="CASCADE"), nullable=False, index=True)
+    flashcard_id = db.Column(db.Integer, db.ForeignKey("flashcards.id", ondelete="SET NULL"), nullable=True, index=True)
+    deck_id = db.Column(db.Integer, db.ForeignKey("decks.id", ondelete="SET NULL"), nullable=True, index=True)
+    question_number = db.Column(db.Integer, nullable=False)
+    question_type = db.Column(db.String(32), nullable=False, default="multiple_choice")
+    question_text = db.Column(db.Text, nullable=False)
+    correct_answer = db.Column(db.Text, nullable=False)
+    user_answer = db.Column(db.Text, nullable=True)
+    is_correct = db.Column(db.Boolean, nullable=True)
+    time_spent_seconds = db.Column(db.Integer, nullable=True)
+    answered_at = db.Column(db.DateTime, nullable=True)
+    options = db.Column(JSONB, nullable=True)
+    feedback = db.Column(db.Text, nullable=True)
+
+    deck = db.relationship("Deck", backref=db.backref("quiz_answers", passive_deletes=True))
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "quiz_id": self.quiz_id,
+            "flashcard_id": self.flashcard_id,
+            "deck_id": self.deck_id,
+            "question_number": self.question_number,
+            "question_type": self.question_type,
+            "question_text": self.question_text,
+            "correct_answer": self.correct_answer,
+            "user_answer": self.user_answer,
+            "is_correct": self.is_correct,
+            "time_spent_seconds": self.time_spent_seconds,
+            "answered_at": self.answered_at.isoformat() if self.answered_at else None,
+            "options": self.options or [],
+            "feedback": self.feedback,
+        }
+
 class Payment(db.Model):
     __tablename__ = "payments"
 
@@ -228,11 +337,12 @@ from .billing.usage_limits import UsageLimits
 from .security.otp_code import OTPCode
 from .security.trusted_device import TrustedDevice
 from .review import Review
-
+from .teacher_invite import TeacherInvite
 
 __all__ = [
     "User", "Deck", "Flashcard", "Progress", "UserStats",
+    "Quiz", "QuizAnswer",
     "Payment", "UserCredits", "AIGeneration",
     "Subscription", "PaymentTransaction", "UsageLimits",
-    "OTPCode", "TrustedDevice","Review","StudentDeck",
+    "OTPCode", "TrustedDevice","Review","StudentDeck","TeacherInvite",
 ]

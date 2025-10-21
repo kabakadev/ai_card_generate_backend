@@ -1,126 +1,173 @@
 from __future__ import annotations
-import logging, os
+import logging
+import os
 from datetime import datetime
 from flask import request
 from flask_restful import Resource
+
 from config import db, limiter
 from models import PaymentTransaction
-from services.intasend_client import get_intasend_client
-from services.subscription_manager import activate
+from services.payment_utils import (
+    resolve_transaction,
+    backfill_invoice_id,
+    check_payment_status_safe,
+    normalize_payment_state,
+    finalize_if_succeeded,
+)
 
 logger = logging.getLogger(__name__)
 
-def _normalize_state(raw_status: str | None) -> str:
-    s = (raw_status or "").strip().upper()
-    if s in {"COMPLETE", "COMPLETED", "SUCCESS", "SUCCEEDED"}:
-        return "succeeded"
-    if s in {"PENDING", "PROCESSING"}:
-        return "pending"
-    if s in {"FAILED", "CANCELLED", "CANCELED", "EXPIRED", "RETRY"}:
-        return "failed"
-    return "pending"
-
-def _backfill_invoice_id_from_info(tx: PaymentTransaction, info: dict) -> None:
-    raw = info.get("raw") or {}
-    found_invoice = (
-        (raw.get("invoice") or {}).get("invoice_id")
-        or raw.get("invoice_id")
-        or info.get("invoice_id")
-    )
-    if found_invoice and not tx.provider_ref:
-        tx.provider_ref = found_invoice
-        db.session.commit()
-        logger.info("Backfilled provider_ref(invoice_id) for tx id=%s → %s", tx.id, found_invoice)
-
-def _mark_tx_and_activate(tx: PaymentTransaction, status_info: dict) -> None:
-    receipt = None
-    raw = status_info or {}
-    if isinstance(raw.get("raw"), dict):
-        receipt = raw["raw"].get("mpesa_receipt") or raw["raw"].get("receipt")
-    if not receipt and isinstance(raw.get("invoice"), dict):
-        receipt = raw["invoice"].get("mpesa_receipt") or raw["invoice"].get("receipt")
-    tx.mark_succeeded(provider_ref=receipt)
-    activate(
-        tx.user_id,
-        plan="monthly",
-        amount=tx.amount,
-        currency=tx.currency,
-    )
-    try:
-        db.session.commit()
-    except Exception:
-        db.session.rollback()
-        raise
 
 class IntaSendWebhook(Resource):
-    @limiter.limit("60 per minute")  # small global burst
+    """
+    FIXED: Authoritative payment state updater with better error handling.
+    """
+
+    @limiter.limit("60 per minute")
     def post(self):
         payload = request.get_json(silent=True) or {}
-        logger.info("[Webhook] received payload")  # don't log body
+        logger.info("[Webhook] received event keys=%s", sorted(list(payload.keys()))[:10])
 
+        # Optional challenge validation
         expected = (os.getenv("INTASEND_WEBHOOK_CHALLENGE") or "").strip()
         got = (payload.get("challenge") or "").strip()
-        if not expected:
+        if expected:
+            if got != expected:
+                logger.warning("[Webhook] challenge mismatch")
+                return {"error": "unauthorized"}, 401
+        else:
             logger.warning("[Webhook] challenge not configured")
-            return {"error": "server_misconfigured"}, 500
-        if got != expected:
-            logger.warning("[Webhook] challenge mismatch")
-            return {"error": "unauthorized"}, 401
 
-        checkout_id = payload.get("checkout_id") or payload.get("id")
-        api_ref     = payload.get("api_ref") or payload.get("reference")
-        invoice_id  = payload.get("invoice_id") or (payload.get("invoice") or {}).get("invoice_id")
-        raw_state   = payload.get("state") or (payload.get("invoice") or {}).get("state")
-        norm        = _normalize_state(raw_state)
+        # Extract identifiers - be very tolerant of different payload shapes
+        checkout_id = (
+            payload.get("checkout_id") or 
+            payload.get("id") or 
+            payload.get("reference") or
+            payload.get("api_ref")
+        )
+        
+        # CRITICAL FIX: Look for invoice_id in multiple locations
+        invoice_id = (
+            payload.get("invoice_id") or
+            (payload.get("invoice") or {}).get("invoice_id") or
+            (payload.get("invoice") or {}).get("id") or
+            payload.get("invoice_number")
+        )
+        
+        raw_state = (
+            payload.get("state") or 
+            (payload.get("invoice") or {}).get("state") or
+            payload.get("status")
+        )
+        paid_flag = bool(payload.get("paid"))
 
-        # Resolve a local TX first (avoid provider calls if we don't have a match)
-        tx = None
-        if api_ref and str(api_ref).upper().startswith("TX"):
-            try:
-                tx = PaymentTransaction.query.get(int(str(api_ref)[2:]))
-            except Exception:
-                pass
-        if not tx and invoice_id:
-            tx = PaymentTransaction.query.filter_by(provider_ref=invoice_id).first()
-        if not tx and checkout_id:
-            tx = PaymentTransaction.query.filter_by(api_ref=checkout_id).first()
+        # Try to discover user_id from api_ref pattern TX{id}
+        tx_candidate = None
+        user_id = None
+        
+        # Check all possible ref fields for TX pattern
+        for ref_field in [checkout_id, payload.get("api_ref"), payload.get("reference")]:
+            if ref_field and str(ref_field).upper().startswith("TX"):
+                try:
+                    tx_id = int(str(ref_field)[2:])
+                    tx_candidate = PaymentTransaction.query.get(tx_id)
+                    if tx_candidate:
+                        user_id = tx_candidate.user_id
+                        logger.info("[Webhook] Found tx via TX pattern: tx_id=%s", tx_id)
+                        break
+                except Exception:
+                    pass
 
+        # Fallback: search by invoice_id
+        if not user_id and invoice_id:
+            tx_candidate = (
+                PaymentTransaction.query
+                .filter_by(provider_ref=invoice_id)
+                .order_by(PaymentTransaction.created_at.desc())
+                .first()
+            )
+            if tx_candidate:
+                user_id = tx_candidate.user_id
+                logger.info("[Webhook] Found tx via invoice_id: tx_id=%s", tx_candidate.id)
+
+        # Fallback: search by checkout_id
+        if not user_id and checkout_id:
+            tx_candidate = (
+                PaymentTransaction.query
+                .filter_by(api_ref=checkout_id)
+                .order_by(PaymentTransaction.created_at.desc())
+                .first()
+            )
+            if tx_candidate:
+                user_id = tx_candidate.user_id
+                logger.info("[Webhook] Found tx via checkout_id: tx_id=%s", tx_candidate.id)
+
+        # Resolve to best match
+        tx = resolve_transaction(user_id, checkout_id, invoice_id) if user_id else tx_candidate
+        
         if not tx:
-            # Accept to prevent retry storms; FE verify/status can reconcile later
+            logger.info("[Webhook] no transaction matched checkout=%s invoice=%s - accepted", 
+                       checkout_id, invoice_id)
             return {"status": "accepted"}, 202
 
+        # Idempotency: already succeeded
         if tx.status == "succeeded":
+            logger.info("[Webhook] tx_id=%s already succeeded", tx.id)
             return {"status": "ok"}, 200
 
-        status_info = None
-        try:
-            client = get_intasend_client()
-            status_info = client.check_payment_status(
-                invoice_id=tx.provider_ref or None,
-                checkout_id=tx.api_ref or None,
-            )
-        except Exception as e:
-            logger.warning("[Webhook] status check failed: %s", e)
-            status_info = {"state": raw_state}
+        # CRITICAL FIX: Backfill invoice_id from webhook payload first
+        if invoice_id and not tx.provider_ref:
+            logger.info("[Webhook] Backfilling invoice_id=%s for tx_id=%s", invoice_id, tx.id)
+            backfill_invoice_id(tx, {"invoice_id": invoice_id})
 
-        _backfill_invoice_id_from_info(tx, status_info or {})
+        # Confirm with provider (authoritative check)
+        status_info = check_payment_status_safe(tx, max_retries=2)
+        
+        # Try to backfill again from status response
+        backfill_invoice_id(tx, status_info.get("raw") or {})
 
-        final_raw_state = (
-            (status_info.get("invoice") or {}).get("state")
-            or (status_info or {}).get("state")
-            or raw_state
-        )
-        decided = _normalize_state(final_raw_state)
-        logger.info("[Webhook] tx=%s state=%s → %s", tx.id, final_raw_state, decided)
+        # Decide state
+        decided = status_info.get("normalized_state") or normalize_payment_state(raw_state)
+        
+        # Trust paid flag if provider says so
+        if paid_flag and decided == "pending":
+            logger.info("[Webhook] paid=True flag forces succeeded for tx_id=%s", tx.id)
+            decided = "succeeded"
+
+        logger.info("[Webhook] tx=%s provider_state=%s decided=%s paid=%s", 
+                   tx.id, raw_state, decided, paid_flag)
 
         if decided == "succeeded":
-            _mark_tx_and_activate(tx, status_info or {})
-        elif decided == "failed":
-            tx.mark_failed(reason="webhook: FAILED")
-            db.session.commit()
-        else:
+            if finalize_if_succeeded(tx, status_info):
+                logger.info("[Webhook] Successfully activated tx_id=%s", tx.id)
+                return {"status": "ok"}, 200
+            logger.error("[Webhook] activation failed for tx_id=%s", tx.id)
+            return {"status": "error"}, 500
+
+        if decided == "failed":
+            try:
+                tx.status = "failed"
+                tx.failure_reason = "webhook: FAILED"
+                tx.provider_status = status_info.get("status") or raw_state
+                tx.updated_at = datetime.utcnow()
+                db.session.add(tx)
+                db.session.commit()
+                logger.info("[Webhook] Marked tx_id=%s as failed", tx.id)
+            except Exception:
+                db.session.rollback()
+                logger.exception("[Webhook] failed to mark tx_id=%s as failed", tx.id)
+            return {"status": "ok"}, 200
+
+        # Still pending
+        try:
             tx.status = "pending"
+            tx.provider_status = status_info.get("status") or raw_state
             tx.updated_at = datetime.utcnow()
+            db.session.add(tx)
             db.session.commit()
+            logger.info("[Webhook] Updated tx_id=%s to pending", tx.id)
+        except Exception:
+            db.session.rollback()
+            logger.exception("[Webhook] failed to persist pending for tx_id=%s", tx.id)
 
         return {"status": "ok"}, 200

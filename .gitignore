@@ -38,3 +38,4 @@ __pycache__/
 smoke.sh
 test_admin_refactor.sh
 test_ai_refactor.sh
+smoke_invites.sh
