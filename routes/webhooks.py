@@ -1,21 +1,45 @@
 from __future__ import annotations
 import logging
 import os
-from datetime import datetime
-from flask import request
+import hmac
+import hashlib
+from flask import request, current_app
 from flask_restful import Resource
+from flask_jwt_extended import jwt_required, get_jwt_identity
 
-from config import db, limiter
+from config import limiter
 from models import PaymentTransaction
 from services.payment_utils import (
     resolve_transaction,
-    backfill_invoice_id,
-    check_payment_status_safe,
-    normalize_payment_state,
-    finalize_if_succeeded,
 )
+from services.background_jobs import enqueue_intasend_webhook_job
 
 logger = logging.getLogger(__name__)
+
+
+_SIGNATURE_HEADER = "X-IntaSend-Signature"
+
+
+def _normalize_signature(sig: str | None) -> str | None:
+    if not sig:
+        return None
+    trimmed = sig.strip()
+    if not trimmed:
+        return None
+    if "=" in trimmed:
+        prefix, _, value = trimmed.partition("=")
+        if prefix.lower() in {"sha256", "hmac"}:
+            trimmed = value.strip()
+    return trimmed.lower() or None
+
+
+def _verify_intasend_signature(raw_body: bytes, signature_header: str | None) -> bool:
+    secret = (current_app.config.get("INTASEND_WEBHOOK_SECRET") or "").strip()
+    provided = _normalize_signature(signature_header)
+    if not secret or not provided:
+        return False
+    digest = hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(digest, provided)
 
 
 class IntaSendWebhook(Resource):
@@ -25,6 +49,21 @@ class IntaSendWebhook(Resource):
 
     @limiter.limit("60 per minute")
     def post(self):
+        raw_body = request.get_data() or b""
+
+        signature_required = current_app.config.get("INTASEND_WEBHOOK_SIGNATURE_REQUIRED", True)
+        signature_header = request.headers.get(_SIGNATURE_HEADER)
+        if signature_required:
+            if not signature_header:
+                logger.warning("[Webhook] missing signature header from %s", request.remote_addr)
+                return {"error": "invalid_signature"}, 401
+            if not _verify_intasend_signature(raw_body, signature_header):
+                logger.warning("[Webhook] signature verification failed from %s", request.remote_addr)
+                return {"error": "invalid_signature"}, 401
+        else:
+            if signature_header and not _verify_intasend_signature(raw_body, signature_header):
+                logger.warning("[Webhook] signature mismatch while verification disabled (check configuration)")
+
         payload = request.get_json(silent=True) or {}
         logger.info("[Webhook] received event keys=%s", sorted(list(payload.keys()))[:10])
 
@@ -110,64 +149,68 @@ class IntaSendWebhook(Resource):
                        checkout_id, invoice_id)
             return {"status": "accepted"}, 202
 
-        # Idempotency: already succeeded
-        if tx.status == "succeeded":
-            logger.info("[Webhook] tx_id=%s already succeeded", tx.id)
-            return {"status": "ok"}, 200
+        enqueue_ok = enqueue_intasend_webhook_job(
+            tx_id=tx.id,
+            checkout_id=checkout_id or tx.api_ref,
+            invoice_id=invoice_id,
+            raw_state=raw_state,
+            paid_flag=paid_flag,
+            payload=payload,
+        )
 
-        # CRITICAL FIX: Backfill invoice_id from webhook payload first
-        if invoice_id and not tx.provider_ref:
-            logger.info("[Webhook] Backfilling invoice_id=%s for tx_id=%s", invoice_id, tx.id)
-            backfill_invoice_id(tx, {"invoice_id": invoice_id})
+        if not enqueue_ok:
+            logger.error("[Webhook] queue full, cannot enqueue tx_id=%s", tx.id)
+            return {"error": "queue_full"}, 503
 
-        # Confirm with provider (authoritative check)
-        status_info = check_payment_status_safe(tx, max_retries=2)
-        
-        # Try to backfill again from status response
-        backfill_invoice_id(tx, status_info.get("raw") or {})
+        return {"status": "processing", "tx_id": tx.id}, 200
 
-        # Decide state
-        decided = status_info.get("normalized_state") or normalize_payment_state(raw_state)
-        
-        # Trust paid flag if provider says so
-        if paid_flag and decided == "pending":
-            logger.info("[Webhook] paid=True flag forces succeeded for tx_id=%s", tx.id)
-            decided = "succeeded"
 
-        logger.info("[Webhook] tx=%s provider_state=%s decided=%s paid=%s", 
-                   tx.id, raw_state, decided, paid_flag)
+class IntaSendWebhookStatus(Resource):
+    @jwt_required()
+    def get(self):
+        tx_id = request.args.get("tx_id", type=int)
+        checkout_id = request.args.get("checkout_id") or request.args.get("api_ref")
+        invoice_id = request.args.get("invoice_id")
 
-        if decided == "succeeded":
-            if finalize_if_succeeded(tx, status_info):
-                logger.info("[Webhook] Successfully activated tx_id=%s", tx.id)
-                return {"status": "ok"}, 200
-            logger.error("[Webhook] activation failed for tx_id=%s", tx.id)
-            return {"status": "error"}, 500
+        if not any([tx_id, checkout_id, invoice_id]):
+            return {"error": "missing_identifier"}, 400
 
-        if decided == "failed":
-            try:
-                tx.status = "failed"
-                tx.failure_reason = "webhook: FAILED"
-                tx.provider_status = status_info.get("status") or raw_state
-                tx.updated_at = datetime.utcnow()
-                db.session.add(tx)
-                db.session.commit()
-                logger.info("[Webhook] Marked tx_id=%s as failed", tx.id)
-            except Exception:
-                db.session.rollback()
-                logger.exception("[Webhook] failed to mark tx_id=%s as failed", tx.id)
-            return {"status": "ok"}, 200
+        tx = None
+        if tx_id:
+            tx = PaymentTransaction.query.get(tx_id)
+        if not tx and checkout_id:
+            tx = (
+                PaymentTransaction.query
+                .filter_by(api_ref=checkout_id)
+                .order_by(PaymentTransaction.created_at.desc())
+                .first()
+            )
+        if not tx and invoice_id:
+            tx = (
+                PaymentTransaction.query
+                .filter_by(provider_ref=invoice_id)
+                .order_by(PaymentTransaction.created_at.desc())
+                .first()
+            )
 
-        # Still pending
-        try:
-            tx.status = "pending"
-            tx.provider_status = status_info.get("status") or raw_state
-            tx.updated_at = datetime.utcnow()
-            db.session.add(tx)
-            db.session.commit()
-            logger.info("[Webhook] Updated tx_id=%s to pending", tx.id)
-        except Exception:
-            db.session.rollback()
-            logger.exception("[Webhook] failed to persist pending for tx_id=%s", tx.id)
+        if not tx:
+            return {"error": "not_found"}, 404
 
-        return {"status": "ok"}, 200
+        identity = get_jwt_identity()
+        if isinstance(identity, dict):
+            user_id = identity.get("id")
+        else:
+            user_id = identity
+        if user_id and tx.user_id != user_id:
+            return {"error": "forbidden"}, 403
+
+        data = {
+            "tx_id": tx.id,
+            "status": tx.status,
+            "provider_status": tx.provider_status,
+            "provider_ref": tx.provider_ref,
+            "api_ref": tx.api_ref,
+            "updated_at": tx.updated_at.isoformat() + "Z" if tx.updated_at else None,
+        }
+
+        return {"transaction": data}, 200

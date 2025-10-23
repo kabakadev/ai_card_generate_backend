@@ -6,6 +6,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 # Import configuration and extensions
 from config import app, db, api
+from services.background_jobs import init_background_workers
 
 logger = logging.getLogger(__name__)
 
@@ -48,11 +49,12 @@ def register_routes():
 
     # Billing routes
     from routes.payments_routes import BillingCheckout, BillingStatus, VerifyPayment, DebugIntaSendStatus
-    from routes.webhooks import IntaSendWebhook
+    from routes.webhooks import IntaSendWebhook, IntaSendWebhookStatus
     api.add_resource(BillingCheckout, "/billing/checkout")
     api.add_resource(BillingStatus, "/billing/status")
     api.add_resource(VerifyPayment, "/billing/verify")
     api.add_resource(IntaSendWebhook, "/billing/webhooks/intasend", "/billing/webhooks/intasend/")
+    api.add_resource(IntaSendWebhookStatus, "/webhooks/intasend/status")
     api.add_resource(DebugIntaSendStatus, "/debug/intasend/status")
 
     # Admin routes (only if enabled)
@@ -251,7 +253,8 @@ def create_app():
     register_core_routes()
     register_routes()
     register_error_handlers()
-    
+    init_background_workers(app)
+
     logger.info("FlashLearn API application initialized successfully")
     return app
 

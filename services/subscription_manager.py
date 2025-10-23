@@ -108,6 +108,8 @@ def activate(
     plan: str = "monthly",
     amount: Optional[int] = None,
     currency: Optional[str] = "KES",
+    *,
+    commit: bool = True,
 ) -> Subscription:
     """
     Upsert/extend a subscription period.
@@ -182,21 +184,25 @@ def activate(
         except Exception as e:
             logger.warning("Non-fatal: failed to update user flags for user_id=%s: %s", user_id, e)
 
-        db.session.commit()
-        db.session.refresh(sub)
+        if commit:
+            db.session.commit()
+            db.session.refresh(sub)
 
-        # Post-commit sanity
-        active_now, _ = is_active(user_id)
-        if not active_now:
-            logger.error(
-                "Activation anomaly: is_active=False immediately after activation (user_id=%s, sub_id=%s)",
-                user_id, sub.id
+            # Post-commit sanity
+            active_now, _ = is_active(user_id)
+            if not active_now:
+                logger.error(
+                    "Activation anomaly: is_active=False immediately after activation (user_id=%s, sub_id=%s)",
+                    user_id, sub.id
+                )
+
+            logger.info(
+                "Activation persisted: sub_id=%s status=%s start=%s end=%s",
+                sub.id, getattr(sub, "status", None), sub.start_date, sub.end_date
             )
+        else:
+            db.session.flush()
 
-        logger.info(
-            "Activation persisted: sub_id=%s status=%s start=%s end=%s",
-            sub.id, getattr(sub, "status", None), sub.start_date, sub.end_date
-        )
         return sub
 
     except Exception as e:

@@ -102,7 +102,13 @@ def resolve_transaction(
         return None
 
 
-def backfill_invoice_id(tx: PaymentTransaction, intasend_response: dict) -> bool:
+def backfill_invoice_id(
+    tx: PaymentTransaction,
+    intasend_response: dict,
+    *,
+    auto_commit: bool = False,
+    auto_flush: bool = True,
+) -> bool:
     """
     FIXED: Extract invoice_id from multiple possible locations.
     """
@@ -131,14 +137,12 @@ def backfill_invoice_id(tx: PaymentTransaction, intasend_response: dict) -> bool
         logger.info("[payment_utils] backfill invoice_id=%s onto tx_id=%s", invoice_id, tx.id)
         tx.provider_ref = invoice_id
         tx.updated_at = datetime.utcnow()
-        try:
-            db.session.add(tx)
+        db.session.add(tx)
+        if auto_flush:
+            db.session.flush()
+        if auto_commit:
             db.session.commit()
-            return True
-        except Exception as exc:
-            logger.exception("[payment_utils] backfill commit failed: %s", exc)
-            db.session.rollback()
-            return False
+        return True
 
     return False
 
@@ -170,7 +174,12 @@ def extract_receipt_from_response(intasend_response: dict) -> Optional[str]:
     return None
 
 
-def activate_subscription_for_transaction(tx: PaymentTransaction, intasend_response: dict) -> bool:
+def activate_subscription_for_transaction(
+    tx: PaymentTransaction,
+    intasend_response: dict,
+    *,
+    auto_commit: bool = True,
+) -> bool:
     """Activate subscription for successful payment."""
     if not tx:
         logger.warning("[payment_utils] activate called with None tx")
@@ -201,20 +210,29 @@ def activate_subscription_for_transaction(tx: PaymentTransaction, intasend_respo
         amount = tx.amount or int(default_amount)
         currency = tx.currency or str(app.config.get("BILLING_CURRENCY", "KES"))
 
-        activate(tx.user_id, plan=plan_type, amount=amount, currency=currency)
+        activate(tx.user_id, plan=plan_type, amount=amount, currency=currency, commit=auto_commit)
 
         logger.info(
             "[payment_utils] activation complete tx_id=%s plan=%s receipt=%s",
             tx.id, plan_type, receipt,
         )
+        if not auto_commit:
+            db.session.flush()
         return True
     except Exception as exc:
         logger.exception("[payment_utils] activation failed for tx_id=%s: %s", getattr(tx, "id", None), exc)
-        db.session.rollback()
-        return False
+        if auto_commit:
+            db.session.rollback()
+            return False
+        raise
 
 
-def finalize_if_succeeded(tx: PaymentTransaction, provider_payload: dict) -> bool:
+def finalize_if_succeeded(
+    tx: PaymentTransaction,
+    provider_payload: dict,
+    *,
+    auto_commit: bool = True,
+) -> bool:
     """Finalize transaction if provider indicates success."""
     if not tx:
         return False
@@ -225,9 +243,11 @@ def finalize_if_succeeded(tx: PaymentTransaction, provider_payload: dict) -> boo
             or ((provider_payload or {}).get("raw") or {}).get("state")
         )
         if normalized == "succeeded" or (provider_payload or {}).get("paid") is True:
-            return activate_subscription_for_transaction(tx, provider_payload)
+            return activate_subscription_for_transaction(tx, provider_payload, auto_commit=auto_commit)
     except Exception as exc:
         logger.exception("[payment_utils] finalize_if_succeeded error for tx_id=%s: %s", getattr(tx, "id", None), exc)
+        if not auto_commit:
+            raise
     return False
 
 
