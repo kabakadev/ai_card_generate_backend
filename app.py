@@ -6,6 +6,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 # Import configuration and extensions
 from config import app, db, api
+from services.background_jobs import init_background_workers
 
 logger = logging.getLogger(__name__)
 
@@ -48,11 +49,12 @@ def register_routes():
 
     # Billing routes
     from routes.payments_routes import BillingCheckout, BillingStatus, VerifyPayment, DebugIntaSendStatus
-    from routes.webhooks import IntaSendWebhook
+    from routes.webhooks import IntaSendWebhook, IntaSendWebhookStatus
     api.add_resource(BillingCheckout, "/billing/checkout")
     api.add_resource(BillingStatus, "/billing/status")
     api.add_resource(VerifyPayment, "/billing/verify")
     api.add_resource(IntaSendWebhook, "/billing/webhooks/intasend", "/billing/webhooks/intasend/")
+    api.add_resource(IntaSendWebhookStatus, "/webhooks/intasend/status")
     api.add_resource(DebugIntaSendStatus, "/debug/intasend/status")
 
     # Admin routes (only if enabled)
@@ -64,7 +66,8 @@ def register_routes():
             AdminCreateDemoUsers,
             AdminListUsers,
             AdminOnlineUsers,
-            AdminUserStats
+            AdminUserStats,
+            AdminCreateTeacherInvite
         )
         api.add_resource(AdminDeleteUsers, "/admin/users/delete")
         api.add_resource(AdminDeleteUsersByIds, "/admin/users/delete-by-ids")
@@ -73,6 +76,7 @@ def register_routes():
         api.add_resource(AdminListUsers, "/admin/users/list")
         api.add_resource(AdminOnlineUsers, "/admin/users/online")
         api.add_resource(AdminUserStats, "/admin/users/stats")
+        api.add_resource(AdminCreateTeacherInvite, "/admin/teacher-invites")
         logger.info("Admin routes registered (refactored)")
 
 
@@ -109,6 +113,14 @@ def register_routes():
     api.add_resource(TeacherListStudentDecks, "/teacher/students/<int:student_id>/decks")
 
     api.add_resource(TeacherCopyDeck, "/teacher/decks/copy")
+
+    from routes.teacher_invites_redeem import RedeemTeacherInvite   
+    api.add_resource(RedeemTeacherInvite, "/auth/teacher/redeem")
+
+    from routes.study_routes import study_bp
+    from routes.quiz_routes import quiz_bp
+    app.register_blueprint(study_bp)
+    app.register_blueprint(quiz_bp)
 
 
 
@@ -241,7 +253,8 @@ def create_app():
     register_core_routes()
     register_routes()
     register_error_handlers()
-    
+    init_background_workers(app)
+
     logger.info("FlashLearn API application initialized successfully")
     return app
 

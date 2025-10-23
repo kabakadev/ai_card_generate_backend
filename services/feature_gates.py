@@ -11,10 +11,17 @@ Plan = Literal["free", "premium"]
 # ----- Freemium limits (MVP) -----
 FREE_TIER_MONTHLY_AI = 5        # 5 prompts / month
 FREE_TIER_MAX_DECKS   = 3       # (optional UI constraint)
+FREE_TIER_WEEKLY_QUIZZES = 5
+PREMIUM_TIER_MONTHLY_AI = 100  # soft cap for reporting
 
 # ----- Helpers for the monthly usage model we implemented -----
 def month_key_now() -> str:
     return datetime.utcnow().strftime("%Y-%m")
+
+
+def week_key_now() -> str:
+    """Return current week key (YYYY-WNN format)."""
+    return datetime.utcnow().strftime("%Y-W%U")
 
 def ensure_month_usage(user_id: int, month_key: Optional[str] = None) -> UsageLimits:
     mk = month_key or month_key_now()
@@ -22,6 +29,20 @@ def ensure_month_usage(user_id: int, month_key: Optional[str] = None) -> UsageLi
     if not row:
         row = UsageLimits(user_id=user_id, month_key=mk, free_quota=FREE_TIER_MONTHLY_AI)
         db.session.add(row)
+        db.session.commit()
+    return row
+
+def ensure_week_usage(user_id: int, week_key: Optional[str] = None) -> UsageLimits:
+    """
+    Ensure a usage row exists and is aligned with the requested week.
+    The UsageLimits table stores month data as well, so we reuse the monthly row
+    and reset the weekly counters when the week changes.
+    """
+    row = ensure_month_usage(user_id)
+    wk = week_key or week_key_now()
+    if row.week_key != wk:
+        row.week_key = wk
+        row.quiz_count = 0
         db.session.commit()
     return row
 
@@ -40,7 +61,28 @@ def free_tier_limits() -> dict:
     return {
         "monthly_ai_prompts": FREE_TIER_MONTHLY_AI,
         "max_decks": FREE_TIER_MAX_DECKS,
+        "weekly_quizzes": FREE_TIER_WEEKLY_QUIZZES,
     }
+
+def premium_benefits() -> dict:
+    return {
+        "monthly_ai_prompts": PREMIUM_TIER_MONTHLY_AI,
+        "weekly_quizzes": "unlimited",
+        "time_analytics": True,
+        "weak_cards": True,
+        "daily_trends": True,
+    }
+
+def get_remaining_weekly_quizzes(user_id: int) -> Tuple[int, UsageLimits]:
+    row = ensure_week_usage(user_id)
+    remaining = max(0, FREE_TIER_WEEKLY_QUIZZES - (row.quiz_count or 0))
+    return remaining, row
+
+def increment_weekly_quizzes(user_id: int, n: int = 1) -> UsageLimits:
+    row = ensure_week_usage(user_id)
+    row.quiz_count = (row.quiz_count or 0) + max(1, n)
+    db.session.commit()
+    return row
 
 # ----- Compatibility layer for “trial” fields (if present) -----
 def _has_user_trial_fields(user: User) -> bool:
@@ -111,11 +153,14 @@ def can_generate_now(user: User) -> Tuple[bool, dict]:
     if plan == "premium":
         mk = month_key_now()
         row = ensure_month_usage(user.id, mk)
+        limit = PREMIUM_TIER_MONTHLY_AI
+        remaining = max(0, limit - (row.ai_prompt_count or 0))
         return True, {
             "plan": plan,
             "month_key": mk,
             "used": row.ai_prompt_count or 0,
-            "remaining": 10**9,  # effectively unlimited for UI, change if you add caps
+            "remaining": remaining if remaining > 0 else "unlimited",
+            "limit": limit,
             "free_quota": row.free_quota or FREE_TIER_MONTHLY_AI,
         }
 
@@ -127,4 +172,35 @@ def can_generate_now(user: User) -> Tuple[bool, dict]:
         "used": row.ai_prompt_count or 0,
         "remaining": remaining,
         "free_quota": row.free_quota or FREE_TIER_MONTHLY_AI,
+        "limit": row.free_quota or FREE_TIER_MONTHLY_AI,
+    }
+
+
+def can_take_quiz(user: User) -> Tuple[bool, dict]:
+    """
+    Quiz generation gate check.
+    Premium: Unlimited attempts (soft cap not enforced).
+    Free: Hard cap of FREE_TIER_WEEKLY_QUIZZES per week.
+    """
+    plan = get_effective_plan_for_user(user)
+    row = ensure_week_usage(user.id)
+    used = row.quiz_count or 0
+
+    if plan == "premium":
+        return True, {
+            "plan": plan,
+            "used": used,
+            "limit": "unlimited",
+            "remaining": "unlimited",
+            "week_key": row.week_key,
+        }
+
+    remaining, row = get_remaining_weekly_quizzes(user.id)
+    allowed = remaining > 0
+    return allowed, {
+        "plan": plan,
+        "used": used,
+        "limit": FREE_TIER_WEEKLY_QUIZZES,
+        "remaining": remaining,
+        "week_key": row.week_key,
     }

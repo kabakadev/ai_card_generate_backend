@@ -11,7 +11,11 @@ from models import Subscription, User, PaymentTransaction
 logger = logging.getLogger(__name__)
 
 # ---- config --------------------------------------------------------
-DEFAULT_PERIOD_DAYS = 30
+PLAN_PERIOD_DAYS = {
+    "daily": 1,
+    "monthly": 30,
+}
+DEFAULT_PERIOD_DAYS = PLAN_PERIOD_DAYS["monthly"]
 UTC = timezone.utc
 
 
@@ -31,8 +35,12 @@ def _as_aware_utc(dt: Optional[datetime]) -> Optional[datetime]:
     return dt.astimezone(UTC)
 
 
-def _period_end_from(start: datetime) -> datetime:
-    return start + timedelta(days=DEFAULT_PERIOD_DAYS)
+def _period_days(plan: str) -> int:
+    return PLAN_PERIOD_DAYS.get(plan, DEFAULT_PERIOD_DAYS)
+
+
+def _period_end_from(start: datetime, plan: str) -> datetime:
+    return start + timedelta(days=_period_days(plan))
 
 
 # ---- public API ----------------------------------------------------
@@ -100,6 +108,8 @@ def activate(
     plan: str = "monthly",
     amount: Optional[int] = None,
     currency: Optional[str] = "KES",
+    *,
+    commit: bool = True,
 ) -> Subscription:
     """
     Upsert/extend a subscription period.
@@ -135,14 +145,14 @@ def activate(
 
         if end and end >= now:
             # Extend current active window by one period
-            new_end = end + timedelta(days=DEFAULT_PERIOD_DAYS)
+            new_end = end + timedelta(days=_period_days(plan))
             sub.end_date = new_end  # store aware UTC
             # keep start_date as-is (when the cycle originally started)
             logger.info("Extending sub id=%s end: %s -> %s", sub.id, end, new_end)
         else:
             # (Re)start from now
             sub.start_date = now
-            sub.end_date = _period_end_from(now)
+            sub.end_date = _period_end_from(now, plan)
             logger.info("Starting sub id=%s from now -> end=%s", getattr(sub, "id", None), sub.end_date)
 
         # Set/refresh metadata
@@ -174,21 +184,25 @@ def activate(
         except Exception as e:
             logger.warning("Non-fatal: failed to update user flags for user_id=%s: %s", user_id, e)
 
-        db.session.commit()
-        db.session.refresh(sub)
+        if commit:
+            db.session.commit()
+            db.session.refresh(sub)
 
-        # Post-commit sanity
-        active_now, _ = is_active(user_id)
-        if not active_now:
-            logger.error(
-                "Activation anomaly: is_active=False immediately after activation (user_id=%s, sub_id=%s)",
-                user_id, sub.id
+            # Post-commit sanity
+            active_now, _ = is_active(user_id)
+            if not active_now:
+                logger.error(
+                    "Activation anomaly: is_active=False immediately after activation (user_id=%s, sub_id=%s)",
+                    user_id, sub.id
+                )
+
+            logger.info(
+                "Activation persisted: sub_id=%s status=%s start=%s end=%s",
+                sub.id, getattr(sub, "status", None), sub.start_date, sub.end_date
             )
+        else:
+            db.session.flush()
 
-        logger.info(
-            "Activation persisted: sub_id=%s status=%s start=%s end=%s",
-            sub.id, getattr(sub, "status", None), sub.start_date, sub.end_date
-        )
         return sub
 
     except Exception as e:

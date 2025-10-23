@@ -52,6 +52,14 @@ app.config.update({
 
 })
 
+# ---------------- Helpers ----------------
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 # ---------------- Database Configuration ----------------
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
@@ -108,7 +116,10 @@ app.config.update({
     "INTASEND_PUBLIC_KEY": os.getenv("INTASEND_PUBLIC_KEY", ""),
     "INTASEND_SECRET_KEY": os.getenv("INTASEND_SECRET_KEY", ""),
     "INTASEND_TEST_MODE": os.getenv("INTASEND_TEST_MODE", "true").lower() in {"1", "true", "yes", "on"},
+    "INTASEND_WEBHOOK_SECRET": os.getenv("INTASEND_WEBHOOK_SECRET") or os.getenv("INTASEND_SECRET_KEY", ""),
+    "INTASEND_WEBHOOK_SIGNATURE_REQUIRED": _env_bool("INTASEND_WEBHOOK_SIGNATURE_REQUIRED", True),
     "BILLING_PLAN_MONTHLY_KES": int(os.getenv("BILLING_PLAN_MONTHLY_KES", "100")),
+    "BILLING_PLAN_DAILY_KES": int(os.getenv("BILLING_PLAN_DAILY_KES", "30")),
     "BILLING_CURRENCY": os.getenv("BILLING_CURRENCY", "KES"),
 })
 
@@ -197,6 +208,12 @@ def _mask_sensitive(value: str, keep: int = 4) -> str:
 
 # Log configuration (without sensitive values)
 logger.info(f"Environment: {ENV}")
+
+if not app.config.get("INTASEND_WEBHOOK_SECRET"):
+    logger.warning("IntaSend webhook secret is not configured; signature checks will fail")
+
+if not app.config.get("INTASEND_WEBHOOK_SIGNATURE_REQUIRED", True):
+    logger.warning("IntaSend webhook signature verification is DISABLED. Enable INTASEND_WEBHOOK_SIGNATURE_REQUIRED for production.")
 logger.info(f"Debug mode: {app.debug}")
 logger.info(f"Database: {'PostgreSQL' if 'postgresql' in DATABASE_URL else 'SQLite'}")
 logger.info(f"Admin endpoints: {'enabled' if app.config['ADMIN_ENDPOINTS_ENABLED'] else 'disabled'}")
