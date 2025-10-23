@@ -39,3 +39,8 @@ smoke.sh
 test_admin_refactor.sh
 test_ai_refactor.sh
 smoke_invites.sh
+smoke_quiz.sh
+test_admin_refactor.sh
+test_ai_refactor.sh
+test_stats_service.py
+test_stats_consistency.py
