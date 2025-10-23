@@ -148,6 +148,7 @@ class Dashboard(Resource):
         stats_record.minutes_per_day = time_data_week["daily_minutes"]
         db.session.commit()
 
+        weekly_goal_value= stats_record.weekly_goal #int (default 0)
         stats_block = {
             "accuracy": round(accuracy_ratio, 4),
             "total_reviews": total_reviews,
@@ -158,6 +159,7 @@ class Dashboard(Resource):
             "daily_accuracy": daily_accuracy,
             "weak_cards": weak_cards_detail,
             "focus_score": round(focus_score, 2),
+            "weekly_goal":weekly_goal_value,
         }
 
         plan = get_effective_plan_for_user(user)
@@ -228,6 +230,7 @@ class Dashboard(Resource):
             "stats": {
                 "accuracy": stats_block["accuracy"],
                 "total_reviews": stats_block["total_reviews"],
+                "weekly_goal":stats_block["weekly_goal"],
             },
             "decks": simplified_decks,
             "usage": usage_info,
