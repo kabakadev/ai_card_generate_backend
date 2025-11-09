@@ -81,10 +81,7 @@ class IntaSendWebhook(Resource):
 
     @limiter.limit("60 per minute")
     def post(self):
-        raw_body = request.get_data(cache=False) or b""
-        logger.info("[Webhook] headers=%s", dict(request.headers))
-        logger.info("[Webhook] body[:200]=%r", raw_body[:200])
-
+        raw_body = request.get_data(cache=True) or b""
 
         signature_required = current_app.config.get("INTASEND_WEBHOOK_SIGNATURE_REQUIRED", True)
         signature_header = request.headers.get(_SIGNATURE_HEADER)
@@ -93,21 +90,28 @@ class IntaSendWebhook(Resource):
         logger.info("[Webhook] headers=%s", dict(request.headers))
         logger.info("[Webhook] body[:200]=%r", raw_body[:200])
 
-
-
         payload = request.get_json(silent=True) or {}
+
         expected_challenge = (os.getenv("INTASEND_WEBHOOK_CHALLENGE") or "").strip()
         got_challenge = (payload.get("challenge") or "").strip()
 
+        devhooks_q = (os.getenv("DEVHOOKS_QUERY_TOKEN") or "").strip()
+        got_q = (request.args.get("vh") or "").strip()
+
         if signature_required:
             if signature_header:
+                # Must verify signature if present
                 if not _verify_intasend_signature(raw_body, signature_header):
                     logger.warning("[Webhook] signature verification failed from %s", request.remote_addr)
                     return {"error": "invalid_signature"}, 401
             else:
-                # Fallback: allow if the body challenge matches EXACTLY
-                if not expected_challenge or got_challenge != expected_challenge:
-                    logger.warning("[Webhook] missing signature AND challenge mismatch from %s", request.remote_addr)
+                # No signature → accept if query token matches OR challenge matches
+                if devhooks_q and got_q == devhooks_q:
+                    pass  # accept
+                elif expected_challenge and got_challenge == expected_challenge:
+                    pass  # accept
+                else:
+                    logger.warning("[Webhook] missing signature and no valid vh/challenge from %s", request.remote_addr)
                     return {"error": "invalid_signature"}, 401
         else:
             if signature_header and not _verify_intasend_signature(raw_body, signature_header):
