@@ -13,6 +13,7 @@ from services.payment_utils import (
     resolve_transaction,
 )
 from services.background_jobs import enqueue_intasend_webhook_job
+import base64
 
 logger = logging.getLogger(__name__)
 
@@ -20,28 +21,59 @@ logger = logging.getLogger(__name__)
 _SIGNATURE_HEADER = "X-IntaSend-Signature"
 
 
-def _normalize_signature(sig: str | None) -> str | None:
+def _normalize_signature(sig: str | None) -> tuple[str, str] | None:
+    """
+    Accept raw hex/base64 or prefixed formats like 'sha256=<hex>' or 'hmac <hex>'.
+    DO NOT lowercase the value (base64 is case-sensitive).
+    Returns (prefix, value) where prefix may be ''.
+    """
     if not sig:
         return None
-    trimmed = sig.strip()
-    if not trimmed:
+    v = sig.strip()
+    if not v:
         return None
-    if "=" in trimmed:
-        prefix, _, value = trimmed.partition("=")
-        if prefix.lower() in {"sha256", "hmac"}:
-            trimmed = value.strip()
-    return trimmed.lower() or None
 
+    # Common formats:
+    #   'sha256=<hex>'
+    #   'hmac <hex>'
+    #   '<hex or base64>'
+    if "=" in v:
+        prefix, _, val = v.partition("=")
+        return (prefix.strip().lower(), val.strip())
+    if " " in v:
+        prefix, _, val = v.partition(" ")
+        return (prefix.strip().lower(), val.strip())
+    return ("", v)
 
 def _verify_intasend_signature(raw_body: bytes, signature_header: str | None) -> bool:
     secret = (current_app.config.get("INTASEND_WEBHOOK_SECRET") or "").strip()
-    provided = _normalize_signature(signature_header)
-    if not secret or not provided:
+    if not secret or not signature_header:
         return False
-    digest = hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(digest, provided)
 
+    parsed = _normalize_signature(signature_header)
+    if not parsed:
+        return False
+    prefix, provided = parsed  # keep original case
 
+    # Compute HMAC once
+    mac = hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).digest()
+    hex_digest = mac.hex()  # lowercase hex by definition
+    b64_digest = base64.b64encode(mac).decode("ascii")
+
+    # Accept plain hex (case-insensitive)
+    if provided.lower() == hex_digest:
+        return True
+
+    # Accept base64
+    if hmac.compare_digest(provided, b64_digest):
+        return True
+
+    # If a prefix was given (sha256/hmac), still accept either encoding
+    if prefix in {"sha256", "hmac"}:
+        if provided.lower() == hex_digest or hmac.compare_digest(provided, b64_digest):
+            return True
+
+    return False
 class IntaSendWebhook(Resource):
     """
     FIXED: Authoritative payment state updater with better error handling.
@@ -49,7 +81,7 @@ class IntaSendWebhook(Resource):
 
     @limiter.limit("60 per minute")
     def post(self):
-        raw_body = request.get_data() or b""
+        raw_body = request.get_data(cache=False) or b""
 
         signature_required = current_app.config.get("INTASEND_WEBHOOK_SIGNATURE_REQUIRED", True)
         signature_header = request.headers.get(_SIGNATURE_HEADER)
