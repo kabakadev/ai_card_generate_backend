@@ -82,32 +82,36 @@ class IntaSendWebhook(Resource):
     @limiter.limit("60 per minute")
     def post(self):
         raw_body = request.get_data(cache=False) or b""
+        logger.info("[Webhook] headers=%s", dict(request.headers))
+        logger.info("[Webhook] body[:200]=%r", raw_body[:200])
+
 
         signature_required = current_app.config.get("INTASEND_WEBHOOK_SIGNATURE_REQUIRED", True)
         signature_header = request.headers.get(_SIGNATURE_HEADER)
+
+        # Optional debug logging (remove later)
+        logger.info("[Webhook] headers=%s", dict(request.headers))
+        logger.info("[Webhook] body[:200]=%r", raw_body[:200])
+
+
+
+        payload = request.get_json(silent=True) or {}
+        expected_challenge = (os.getenv("INTASEND_WEBHOOK_CHALLENGE") or "").strip()
+        got_challenge = (payload.get("challenge") or "").strip()
+
         if signature_required:
-            if not signature_header:
-                logger.warning("[Webhook] missing signature header from %s", request.remote_addr)
-                return {"error": "invalid_signature"}, 401
-            if not _verify_intasend_signature(raw_body, signature_header):
-                logger.warning("[Webhook] signature verification failed from %s", request.remote_addr)
-                return {"error": "invalid_signature"}, 401
+            if signature_header:
+                if not _verify_intasend_signature(raw_body, signature_header):
+                    logger.warning("[Webhook] signature verification failed from %s", request.remote_addr)
+                    return {"error": "invalid_signature"}, 401
+            else:
+                # Fallback: allow if the body challenge matches EXACTLY
+                if not expected_challenge or got_challenge != expected_challenge:
+                    logger.warning("[Webhook] missing signature AND challenge mismatch from %s", request.remote_addr)
+                    return {"error": "invalid_signature"}, 401
         else:
             if signature_header and not _verify_intasend_signature(raw_body, signature_header):
                 logger.warning("[Webhook] signature mismatch while verification disabled (check configuration)")
-
-        payload = request.get_json(silent=True) or {}
-        logger.info("[Webhook] received event keys=%s", sorted(list(payload.keys()))[:10])
-
-        # Optional challenge validation
-        expected = (os.getenv("INTASEND_WEBHOOK_CHALLENGE") or "").strip()
-        got = (payload.get("challenge") or "").strip()
-        if expected:
-            if got != expected:
-                logger.warning("[Webhook] challenge mismatch")
-                return {"error": "unauthorized"}, 401
-        else:
-            logger.warning("[Webhook] challenge not configured")
 
         # Extract identifiers - be very tolerant of different payload shapes
         checkout_id = (
