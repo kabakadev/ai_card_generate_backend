@@ -3,20 +3,17 @@ import logging
 import os
 import hmac
 import hashlib
+import base64
 from flask import request, current_app
 from flask_restful import Resource
 from flask_jwt_extended import jwt_required, get_jwt_identity
 
 from config import limiter
 from models import PaymentTransaction
-from services.payment_utils import (
-    resolve_transaction,
-)
+from services.payment_utils import resolve_transaction
 from services.background_jobs import enqueue_intasend_webhook_job
-import base64
 
 logger = logging.getLogger(__name__)
-
 
 _SIGNATURE_HEADER = "X-IntaSend-Signature"
 
@@ -44,6 +41,7 @@ def _normalize_signature(sig: str | None) -> tuple[str, str] | None:
         prefix, _, val = v.partition(" ")
         return (prefix.strip().lower(), val.strip())
     return ("", v)
+
 
 def _verify_intasend_signature(raw_body: bytes, signature_header: str | None) -> bool:
     secret = (current_app.config.get("INTASEND_WEBHOOK_SECRET") or "").strip()
@@ -74,19 +72,22 @@ def _verify_intasend_signature(raw_body: bytes, signature_header: str | None) ->
             return True
 
     return False
+
+
 class IntaSendWebhook(Resource):
     """
-    FIXED: Authoritative payment state updater with better error handling.
+    Authoritative payment state updater with resilient verification + tolerant tx matching.
     """
 
     @limiter.limit("60 per minute")
     def post(self):
+        # Read RAW once; cache=True so request.get_json() can reuse it
         raw_body = request.get_data(cache=True) or b""
 
         signature_required = current_app.config.get("INTASEND_WEBHOOK_SIGNATURE_REQUIRED", True)
         signature_header = request.headers.get(_SIGNATURE_HEADER)
 
-        # Optional debug logging (remove later)
+        # Optional debug logging (remove if too chatty)
         logger.info("[Webhook] headers=%s", dict(request.headers))
         logger.info("[Webhook] body[:200]=%r", raw_body[:200])
 
@@ -98,9 +99,9 @@ class IntaSendWebhook(Resource):
         devhooks_q = (os.getenv("DEVHOOKS_QUERY_TOKEN") or "").strip()
         got_q = (request.args.get("vh") or "").strip()
 
+        # --- Verification ---
         if signature_required:
             if signature_header:
-                # Must verify signature if present
                 if not _verify_intasend_signature(raw_body, signature_header):
                     logger.warning("[Webhook] signature verification failed from %s", request.remote_addr)
                     return {"error": "invalid_signature"}, 401
@@ -117,34 +118,33 @@ class IntaSendWebhook(Resource):
             if signature_header and not _verify_intasend_signature(raw_body, signature_header):
                 logger.warning("[Webhook] signature mismatch while verification disabled (check configuration)")
 
-        # Extract identifiers - be very tolerant of different payload shapes
+        # --- Extract identifiers (tolerant) ---
         checkout_id = (
-            payload.get("checkout_id") or 
-            payload.get("id") or 
-            payload.get("reference") or
-            payload.get("api_ref")
+            payload.get("checkout_id")
+            or payload.get("id")
+            or payload.get("reference")
+            or payload.get("api_ref")
         )
-        
-        # CRITICAL FIX: Look for invoice_id in multiple locations
+
         invoice_id = (
-            payload.get("invoice_id") or
-            (payload.get("invoice") or {}).get("invoice_id") or
-            (payload.get("invoice") or {}).get("id") or
-            payload.get("invoice_number")
+            payload.get("invoice_id")
+            or (payload.get("invoice") or {}).get("invoice_id")
+            or (payload.get("invoice") or {}).get("id")
+            or payload.get("invoice_number")
         )
-        
+
         raw_state = (
-            payload.get("state") or 
-            (payload.get("invoice") or {}).get("state") or
-            payload.get("status")
+            payload.get("state")
+            or (payload.get("invoice") or {}).get("state")
+            or payload.get("status")
         )
         paid_flag = bool(payload.get("paid"))
 
-        # Try to discover user_id from api_ref pattern TX{id}
+        # --- Try to infer user/tx quickly ---
         tx_candidate = None
         user_id = None
-        
-        # Check all possible ref fields for TX pattern
+
+        # Pattern TX{id} in api_ref/reference/checkout_id
         for ref_field in [checkout_id, payload.get("api_ref"), payload.get("reference")]:
             if ref_field and str(ref_field).upper().startswith("TX"):
                 try:
@@ -157,38 +157,50 @@ class IntaSendWebhook(Resource):
                 except Exception:
                     pass
 
-        # Fallback: search by invoice_id
-        if not user_id and invoice_id:
-            tx_candidate = (
+        # Fallback by invoice_id
+        if not tx_candidate and invoice_id:
+            t = (
                 PaymentTransaction.query
                 .filter_by(provider_ref=invoice_id)
                 .order_by(PaymentTransaction.created_at.desc())
                 .first()
             )
-            if tx_candidate:
-                user_id = tx_candidate.user_id
-                logger.info("[Webhook] Found tx via invoice_id: tx_id=%s", tx_candidate.id)
+            if t:
+                tx_candidate = t
+                user_id = t.user_id
+                logger.info("[Webhook] Found tx via invoice_id: tx_id=%s", t.id)
 
-        # Fallback: search by checkout_id
-        if not user_id and checkout_id:
-            tx_candidate = (
+        # Fallback by checkout_id/api_ref
+        if not tx_candidate and checkout_id:
+            t = (
                 PaymentTransaction.query
                 .filter_by(api_ref=checkout_id)
                 .order_by(PaymentTransaction.created_at.desc())
                 .first()
             )
-            if tx_candidate:
-                user_id = tx_candidate.user_id
-                logger.info("[Webhook] Found tx via checkout_id: tx_id=%s", tx_candidate.id)
+            if t:
+                tx_candidate = t
+                user_id = t.user_id
+                logger.info("[Webhook] Found tx via checkout_id: tx_id=%s", t.id)
 
-        # Resolve to best match
-        tx = resolve_transaction(user_id, checkout_id, invoice_id) if user_id else tx_candidate
-        
+        # --- Resolve final tx (do NOT discard candidate if resolve_transaction returns None) ---
+        tx = None
+        if user_id:
+            try:
+                tx = resolve_transaction(user_id, checkout_id, invoice_id)
+            except Exception:
+                # Be defensive; do not fail the webhook because resolve_transaction is strict
+                tx = None
+
         if not tx:
-            logger.info("[Webhook] no transaction matched checkout=%s invoice=%s - accepted", 
-                       checkout_id, invoice_id)
+            tx = tx_candidate  # keep the candidate we already found
+
+        if not tx:
+            logger.info("[Webhook] no transaction matched checkout=%s invoice=%s - accepted", checkout_id, invoice_id)
+            # (Optional: persist raw payload for reconciliation)
             return {"status": "accepted"}, 202
 
+        # --- Enqueue processing (even if state is PENDING/PROCESSING) ---
         enqueue_ok = enqueue_intasend_webhook_job(
             tx_id=tx.id,
             checkout_id=checkout_id or tx.api_ref,
@@ -210,7 +222,7 @@ class IntaSendWebhookStatus(Resource):
     def get(self):
         tx_id = request.args.get("tx_id", type=int)
         checkout_id = request.args.get("checkout_id") or request.args.get("api_ref")
-        invoice_id = request.args.get("invoice_id")
+        invoice_id = request.get_json(silent=True) or request.args.get("invoice_id")
 
         if not any([tx_id, checkout_id, invoice_id]):
             return {"error": "missing_identifier"}, 400
@@ -237,10 +249,7 @@ class IntaSendWebhookStatus(Resource):
             return {"error": "not_found"}, 404
 
         identity = get_jwt_identity()
-        if isinstance(identity, dict):
-            user_id = identity.get("id")
-        else:
-            user_id = identity
+        user_id = identity.get("id") if isinstance(identity, dict) else identity
         if user_id and tx.user_id != user_id:
             return {"error": "forbidden"}, 403
 
