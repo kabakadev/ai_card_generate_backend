@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 
-from sqlalchemy.exc import OperationalError, SQLAlchemyError
+from sqlalchemy.exc import OperationalError, SQLAlchemyError, InvalidRequestError
 
 from config import db
 from models import PaymentTransaction
@@ -30,27 +30,28 @@ def process_intasend_webhook(
     """
     Process an IntaSend webhook delivery and update payment/subscription state.
 
-    - Uses a normal transaction when called from a worker (no active tx).
-    - Uses a NESTED transaction (SAVEPOINT) when called inline during a request, to
-      avoid 'A transaction is already begun on this Session' errors.
+    Transaction handling:
+      - Prefer a NESTED transaction (SAVEPOINT) so this works both inline (inside a
+        request transaction) and in a background worker.
+      - If the dialect/version rejects nested, fall back to a normal transaction.
     """
     payload = payload or {}
 
-    # Decide transaction strategy up front
-    already_in_tx = db.session.in_transaction()
-    ctx = db.session.begin_nested() if already_in_tx else db.session.begin()
-    logger.info(
-        "[IntaSendJob] tx_id=%s begin %s transaction (in_tx=%s)",
-        tx_id,
-        "NESTED" if already_in_tx else "NORMAL",
-        already_in_tx,
-    )
+    # Choose a transaction context that works across SQLAlchemy/Flask-SQLAlchemy versions.
+    # Prefer nested; fallback to normal.
+    try:
+        ctx = db.session.begin_nested()
+        tx_mode = "NESTED"
+    except (InvalidRequestError, AttributeError, TypeError):
+        ctx = db.session.begin()
+        tx_mode = "NORMAL"
 
-    # We'll avoid 'return' inside the context so the context manager can exit cleanly.
+    logger.info("[IntaSendJob] tx_id=%s begin %s transaction", tx_id, tx_mode)
+
     outcome = "noop"
     try:
         with ctx:
-            # Lock the row; this requires being inside a tx.
+            # Lock the row; requires being in a transaction.
             locked_tx = (
                 PaymentTransaction.query
                 .filter_by(id=tx_id)
@@ -70,27 +71,25 @@ def process_intasend_webhook(
                     if invoice_id and not locked_tx.provider_ref:
                         backfill_invoice_id(locked_tx, {"invoice_id": invoice_id}, auto_commit=False)
 
-                    # Poll provider status (safe; handles retries)
+                    # Poll provider for authoritative status
                     status_info = check_payment_status_safe(locked_tx, max_retries=2)
                     raw_provider_payload = status_info.get("raw") or {}
 
                     # Backfill invoice_id from provider payload if present
                     backfill_invoice_id(locked_tx, raw_provider_payload, auto_commit=False)
 
-                    # Normalize final state: use provider-derived state first, then webhook's raw_state
+                    # Normalize final state: prefer provider-derived, else from webhook
                     decided = status_info.get("normalized_state") or normalize_payment_state(raw_state)
                     provider_state = status_info.get("status") or raw_state
 
-                    # If webhook explicitly said 'paid' but normalize says pending, prefer paid
+                    # If webhook says paid but normalization says pending, prefer paid
                     if paid_flag and decided == "pending":
                         logger.info("[IntaSendJob] paid flag overrides pending for tx_id=%s", locked_tx.id)
                         decided = "succeeded"
 
                     logger.info(
                         "[IntaSendJob] tx=%s decided=%s provider_state=%s",
-                        locked_tx.id,
-                        decided,
-                        provider_state,
+                        locked_tx.id, decided, provider_state,
                     )
 
                     if decided == "succeeded":
@@ -98,6 +97,7 @@ def process_intasend_webhook(
                         if not activated:
                             raise RuntimeError(f"Activation helper returned False for tx_id={locked_tx.id}")
                         outcome = "succeeded"
+
                     elif decided == "failed":
                         locked_tx.status = "failed"
                         locked_tx.failure_reason = "webhook: FAILED"
@@ -105,6 +105,7 @@ def process_intasend_webhook(
                         locked_tx.updated_at = datetime.utcnow()
                         db.session.add(locked_tx)
                         outcome = "failed"
+
                     else:
                         # Treat everything else as in-flight
                         locked_tx.status = "pending"
@@ -113,10 +114,9 @@ def process_intasend_webhook(
                         db.session.add(locked_tx)
                         outcome = "pending"
 
-        # Commit strategy:
-        # - NORMAL tx: commit for real.
-        # - NESTED tx: the nested block has released the SAVEPOINT; we only need to flush.
-        if already_in_tx:
+        # Commit/flush depending on transaction mode
+        if tx_mode == "NESTED":
+            # Nested block released the SAVEPOINT; outer scope manages final commit.
             db.session.flush()
             logger.info("[IntaSendJob] tx_id=%s nested transaction flushed (outcome=%s)", tx_id, outcome)
         else:
@@ -124,13 +124,13 @@ def process_intasend_webhook(
             logger.info("[IntaSendJob] tx_id=%s committed (outcome=%s)", tx_id, outcome)
 
     except OperationalError as exc:
-        # DB connectivity/lock issues
         try:
             db.session.rollback()
         except Exception:
             pass
         logger.exception("[IntaSendJob] database error tx_id=%s: %s", tx_id, exc)
         raise
+
     except SQLAlchemyError as exc:
         try:
             db.session.rollback()
@@ -138,6 +138,7 @@ def process_intasend_webhook(
             pass
         logger.exception("[IntaSendJob] SQLAlchemy error tx_id=%s: %s", tx_id, exc)
         raise
+
     except Exception:
         try:
             db.session.rollback()
