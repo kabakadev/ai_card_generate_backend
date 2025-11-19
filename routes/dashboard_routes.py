@@ -39,18 +39,10 @@ class Dashboard(Resource):
         if not user:
             return {"error": "User not found"}, 404
 
-        # 🔹 First: check subscription status via subscription_manager
+        # 🔹 Subscription is the single source of truth
         sub_active, sub = is_active(user_id)
         sub_plan_type = getattr(sub, "plan_type", None) if sub else None
-
-        # 🔹 Then decide the effective plan label for feature gates
-        #     - If subscription is active -> treat as "premium"
-        #     - Else fall back to your existing logic (user flags, etc.)
-        legacy_plan = get_effective_plan_for_user(user)  # e.g. "free" / "premium" / etc.
-        if sub_active:
-            plan = "premium"
-        else:
-            plan = legacy_plan or "free"
+        plan = get_effective_plan_for_user(user)
 
         decks = Deck.query.filter_by(user_id=user_id).all()
         deck_review_rows = db.session.query(
@@ -199,6 +191,7 @@ class Dashboard(Resource):
 
         usage_info = {
             "plan": plan,
+            "plan_type": sub_plan_type if sub_active else None,
             "subscription": {
                 "active": sub_active,
                 "plan_type": sub_plan_type,
