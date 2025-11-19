@@ -1,6 +1,7 @@
 from flask_restful import Resource
 from flask_jwt_extended import jwt_required, get_jwt_identity
 from sqlalchemy import func, case
+
 from config import db
 from models import User, Deck, UserStats, ReviewLog, Flashcard
 from services.stats_service import StatsService
@@ -13,6 +14,7 @@ from services.feature_gates import (
     FREE_TIER_MONTHLY_AI,
     FREE_TIER_WEEKLY_QUIZZES,
 )
+from services.subscription_manager import is_active  # 🔴 NEW
 
 
 def _resolve_user_id(identity):
@@ -36,6 +38,19 @@ class Dashboard(Resource):
         user = User.query.filter_by(id=user_id).first()
         if not user:
             return {"error": "User not found"}, 404
+
+        # 🔹 First: check subscription status via subscription_manager
+        sub_active, sub = is_active(user_id)
+        sub_plan_type = getattr(sub, "plan_type", None) if sub else None
+
+        # 🔹 Then decide the effective plan label for feature gates
+        #     - If subscription is active -> treat as "premium"
+        #     - Else fall back to your existing logic (user flags, etc.)
+        legacy_plan = get_effective_plan_for_user(user)  # e.g. "free" / "premium" / etc.
+        if sub_active:
+            plan = "premium"
+        else:
+            plan = legacy_plan or "free"
 
         decks = Deck.query.filter_by(user_id=user_id).all()
         deck_review_rows = db.session.query(
@@ -148,7 +163,7 @@ class Dashboard(Resource):
         stats_record.minutes_per_day = time_data_week["daily_minutes"]
         db.session.commit()
 
-        weekly_goal_value= stats_record.weekly_goal #int (default 0)
+        weekly_goal_value = stats_record.weekly_goal  # int (default 0)
         stats_block = {
             "accuracy": round(accuracy_ratio, 4),
             "total_reviews": total_reviews,
@@ -159,11 +174,10 @@ class Dashboard(Resource):
             "daily_accuracy": daily_accuracy,
             "weak_cards": weak_cards_detail,
             "focus_score": round(focus_score, 2),
-            "weekly_goal":weekly_goal_value,
+            "weekly_goal": weekly_goal_value,
         }
 
-        plan = get_effective_plan_for_user(user)
-
+        # ---------- Usage / plan limits ----------
         ai_remaining, ai_row = get_remaining_monthly_prompts(user_id)
         quiz_remaining, quiz_row = get_remaining_weekly_quizzes(user_id)
 
@@ -185,6 +199,10 @@ class Dashboard(Resource):
 
         usage_info = {
             "plan": plan,
+            "subscription": {
+                "active": sub_active,
+                "plan_type": sub_plan_type,
+            },
             "ai_generation": {
                 "used": ai_used,
                 "limit": ai_limit,
@@ -200,7 +218,8 @@ class Dashboard(Resource):
         }
 
         print(
-            f"[Dashboard] Returning stats for user {user_id}: plan={plan}, "
+            f"[Dashboard] Returning stats for user {user_id}: "
+            f"plan={plan}, sub_active={sub_active}, sub_plan_type={sub_plan_type}, "
             f"accuracy={accuracy_ratio:.4f}, total_reviews={total_reviews}, "
             f"time_week={total_minutes_week}min, quizzes_used={quiz_used}"
         )
@@ -230,7 +249,7 @@ class Dashboard(Resource):
             "stats": {
                 "accuracy": stats_block["accuracy"],
                 "total_reviews": stats_block["total_reviews"],
-                "weekly_goal":stats_block["weekly_goal"],
+                "weekly_goal": stats_block["weekly_goal"],
             },
             "decks": simplified_decks,
             "usage": usage_info,
