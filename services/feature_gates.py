@@ -3,10 +3,14 @@ from __future__ import annotations
 
 from typing import Literal, Tuple, Optional
 from datetime import datetime
+import logging
+
 from config import db
-from models import User, UsageLimits, Subscription
+from models import User, UsageLimits
+from services.subscription_manager import is_active as sub_is_active
 
 Plan = Literal["free", "premium"]
+logger = logging.getLogger(__name__)
 
 # ----- Freemium limits (MVP) -----
 FREE_TIER_MONTHLY_AI = 5        # 5 prompts / month
@@ -85,60 +89,28 @@ def increment_weekly_quizzes(user_id: int, n: int = 1) -> UsageLimits:
     return row
 
 # ----- Compatibility layer for “trial” fields (if present) -----
-def _has_user_trial_fields(user: User) -> bool:
-    # flashlearn User doesn't have these; the freemium repo did.
-    return all(
-        hasattr(user, name)
-        for name in ("trial_end_date", "subscription_status", "current_plan")
-    )
-
-def is_trial_active(user: User) -> bool:
-    """
-    In flashlearn, User lacks trial fields; this returns False.
-    If those fields exist (from your other backend), we use them.
-    """
-    if not _has_user_trial_fields(user):
-        return False
-    try:
-        return (
-            getattr(user, "subscription_status", None) == "trial"
-            and getattr(user, "trial_end_date", None) is not None
-            and user.trial_end_date >= datetime.utcnow()
-        )
-    except Exception:
-        return False
-
-# ----- Effective plan calculation -----
-def is_subscription_active(user_id: int) -> bool:
-    """
-    Use our new Subscription table (Phase 2) to decide active/inactive.
-    """
-    sub: Subscription | None = Subscription.query.filter_by(user_id=user_id).first()
-    if not sub:
-        return False
-    now = datetime.utcnow()
-    return sub.status == "active" and sub.end_date is not None and sub.end_date > now
-
 def get_effective_plan_for_user(user: User) -> Plan:
     """
-    Mirrors the old behavior:
-      - If trial fields exist and trial is active -> premium
-      - Else if subscription row is active -> premium
-      - Else -> free
+    Determine the publicly visible plan label.
+
+    Subscriptions table is the single source of truth:
+      - If subscription_manager reports active -> "premium"
+      - Otherwise -> "free"
     """
-    # Use trial semantics only when present on User (compat mode)
-    if is_trial_active(user):
-        return "premium"
+    if not user:
+        return "free"
 
-    if is_subscription_active(user.id):
-        return "premium"
+    active, sub = sub_is_active(user.id)
+    sub_plan_type = getattr(sub, "plan_type", None) if sub else None
 
-    # If user has “current_plan/ subscription_status” fields (old model):
-    if _has_user_trial_fields(user):
-        if getattr(user, "current_plan", None) == "premium" and getattr(user, "subscription_status", None) == "active":
-            return "premium"
+    logger.info(
+        "[FeatureGates] get_effective_plan_for_user user_id=%s active=%s sub_plan_type=%s",
+        getattr(user, "id", None),
+        active,
+        sub_plan_type,
+    )
 
-    return "free"
+    return "premium" if active else "free"
 
 # ----- Gate check used by AI generation -----
 def can_generate_now(user: User) -> Tuple[bool, dict]:

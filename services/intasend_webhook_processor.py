@@ -8,14 +8,27 @@ from sqlalchemy.exc import OperationalError, SQLAlchemyError, InvalidRequestErro
 
 from config import db
 from models import PaymentTransaction
-from services.payment_utils import (
-    backfill_invoice_id,
-    check_payment_status_safe,
-    finalize_if_succeeded,
-    normalize_payment_state,
-)
+from services.payment_utils import backfill_invoice_id, normalize_payment_state
+from services.subscription_manager import activate as activate_subscription
 
 logger = logging.getLogger(__name__)
+
+
+def _derive_provider_state(raw_state: str | None, payload: dict | None) -> str | None:
+    payload = payload or {}
+    invoice_block = payload.get("invoice") or {}
+    if raw_state:
+        return raw_state
+    if invoice_block.get("state"):
+        return invoice_block.get("state")
+    return payload.get("status")
+
+
+def _normalize_state(raw_state: str | None, paid_flag: bool) -> str:
+    normalized = normalize_payment_state(raw_state)
+    if paid_flag and normalized != "failed":
+        return "succeeded"
+    return normalized
 
 
 def process_intasend_webhook(
@@ -67,52 +80,63 @@ def process_intasend_webhook(
                     logger.info("[IntaSendJob] tx_id=%s already succeeded", locked_tx.id)
                     outcome = "already_succeeded"
                 else:
-                    # Backfill invoice_id if webhook supplied one
-                    if invoice_id and not locked_tx.provider_ref:
+                    if checkout_id and not locked_tx.api_ref:
+                        locked_tx.api_ref = checkout_id
+
+                    provider_payload = payload or {}
+                    provider_state = _derive_provider_state(raw_state, provider_payload)
+                    normalized_state = _normalize_state(provider_state, paid_flag)
+
+                    if invoice_id:
                         backfill_invoice_id(locked_tx, {"invoice_id": invoice_id}, auto_commit=False)
+                    backfill_invoice_id(locked_tx, provider_payload, auto_commit=False)
 
-                    # Poll provider for authoritative status
-                    status_info = check_payment_status_safe(locked_tx, max_retries=2)
-                    raw_provider_payload = status_info.get("raw") or {}
-
-                    # Backfill invoice_id from provider payload if present
-                    backfill_invoice_id(locked_tx, raw_provider_payload, auto_commit=False)
-
-                    # Normalize final state: prefer provider-derived, else from webhook
-                    decided = status_info.get("normalized_state") or normalize_payment_state(raw_state)
-                    provider_state = status_info.get("status") or raw_state
-
-                    # If webhook says paid but normalization says pending, prefer paid
-                    if paid_flag and decided == "pending":
-                        logger.info("[IntaSendJob] paid flag overrides pending for tx_id=%s", locked_tx.id)
-                        decided = "succeeded"
+                    locked_tx.provider_status = provider_state or locked_tx.provider_status
+                    now = datetime.utcnow()
 
                     logger.info(
-                        "[IntaSendJob] tx=%s decided=%s provider_state=%s",
-                        locked_tx.id, decided, provider_state,
+                        "[IntaSendWebhook] tx=%s normalized=%s provider_state=%s user_id=%s plan_type=%s",
+                        locked_tx.id,
+                        normalized_state,
+                        provider_state,
+                        locked_tx.user_id,
+                        locked_tx.plan_type,
                     )
 
-                    if decided == "succeeded":
-                        activated = finalize_if_succeeded(locked_tx, status_info, auto_commit=False)
-                        if not activated:
-                            raise RuntimeError(f"Activation helper returned False for tx_id={locked_tx.id}")
+                    if normalized_state == "succeeded":
+                        if locked_tx.status != "succeeded":
+                            locked_tx.status = "succeeded"
+                            locked_tx.completed_at = locked_tx.completed_at or now
+                            locked_tx.failure_reason = None
+                            plan_type = (locked_tx.plan_type or "monthly").lower()
+                            sub = activate_subscription(
+                                locked_tx.user_id,
+                                plan=plan_type,
+                                amount=locked_tx.amount,
+                                currency=locked_tx.currency,
+                                commit=False,
+                            )
+                            logger.info(
+                                "[IntaSendWebhook] Activated subscription: sub_id=%s start=%s end=%s",
+                                getattr(sub, "id", None),
+                                getattr(sub, "start_date", None),
+                                getattr(sub, "end_date", None),
+                            )
                         outcome = "succeeded"
 
-                    elif decided == "failed":
-                        locked_tx.status = "failed"
-                        locked_tx.failure_reason = "webhook: FAILED"
-                        locked_tx.provider_status = provider_state or locked_tx.provider_status
-                        locked_tx.updated_at = datetime.utcnow()
-                        db.session.add(locked_tx)
+                    elif normalized_state == "failed":
+                        if locked_tx.status != "succeeded":
+                            locked_tx.status = "failed"
+                            locked_tx.failure_reason = "webhook: FAILED"
+                            locked_tx.updated_at = now
                         outcome = "failed"
 
                     else:
-                        # Treat everything else as in-flight
                         locked_tx.status = "pending"
-                        locked_tx.provider_status = provider_state or locked_tx.provider_status
-                        locked_tx.updated_at = datetime.utcnow()
-                        db.session.add(locked_tx)
+                        locked_tx.updated_at = now
                         outcome = "pending"
+
+                    db.session.add(locked_tx)
 
         # Commit/flush depending on transaction mode
         if tx_mode == "NESTED":
