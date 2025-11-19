@@ -239,3 +239,34 @@ def get_or_create_subscription(user_id: int, plan: str = "monthly") -> Subscript
     db.session.add(sub)
     db.session.commit()
     return sub
+
+# ---- read helpers for API / UI ----------------------------------------
+
+def get_active_subscription(user_id: int) -> Optional[Subscription]:
+    """
+    Thin wrapper around is_active() that just returns the Subscription row
+    if the user is active, otherwise None.
+    """
+    active, sub = is_active(user_id)
+    return sub if active else None
+
+
+def get_current_plan(user_id: int) -> str:
+    """
+    Return the current plan label for a user.
+
+    - If there is an active subscription, use its `plan_type`
+      (e.g. 'daily', 'monthly').
+    - If there is no active subscription, return 'free'.
+    - If there is an active sub but plan_type is somehow empty, fall back to 'paid'.
+    """
+    sub = get_active_subscription(user_id)
+    if not sub:
+        return "free"
+
+    plan = (getattr(sub, "plan_type", "") or "").strip().lower()
+    if not plan:
+        return "paid"
+
+    return plan
+

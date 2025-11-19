@@ -9,6 +9,7 @@ import re
 
 from config import db, limiter
 from models import User
+from services.subscription_manager import is_active  # 🔴 NEW IMPORT
 
 # ---------------- Validators ----------------
 def is_valid_email(email: str) -> bool:
@@ -112,7 +113,8 @@ class ProtectedUser(Resource):
     @jwt_required()
     def get(self):
         """
-        Return current user's profile and update last_seen_at.
+        Return current user's profile, update last_seen_at,
+        and include subscription/plan info.
         """
         user_id = get_jwt_identity()
         user = User.query.get(user_id)
@@ -126,6 +128,28 @@ class ProtectedUser(Resource):
         except Exception:
             db.session.rollback()  # keep response even if commit fails
 
+        # 🔹 Subscription status from subscription_manager
+        sub_active, sub = is_active(user.id)
+
+        # Safely derive plan + subscription details
+        sub_plan = getattr(sub, "plan_type", None) if sub else None
+        sub_status = getattr(sub, "status", None) if sub else None
+        sub_start = getattr(sub, "start_date", None) if sub else None
+        sub_end = getattr(sub, "end_date", None) if sub else None
+
+        # Use user.plan_type as fallback if present
+        user_plan_field = getattr(user, "plan_type", None)
+
+        # Decide what to expose as "plan" to the frontend
+        if sub_active:
+            effective_plan = sub_plan or user_plan_field or "premium"
+        else:
+            # either explicitly "free" or whatever you use for non-paid
+            effective_plan = user_plan_field or "free"
+
+        # is_premium: true if subscription is active OR user flag is set
+        effective_is_premium = bool(sub_active or getattr(user, "is_premium", False))
+
         return {
             "id": user.id,
             "email": user.email,
@@ -134,7 +158,18 @@ class ProtectedUser(Resource):
             "is_demo": bool(user.is_demo),
             "last_seen_at": user.last_seen_at.isoformat() if user.last_seen_at else None,
             "created_at": user.created_at.isoformat() if user.created_at else None,
-            "role": user.role,  # ← add this
+            "role": user.role,
+            # 🔹 NEW: top-level plan info for your frontend
+            "plan": effective_plan,
+            "is_premium": effective_is_premium,
+            # 🔹 NEW: detailed subscription payload (safe for nulls)
+            "subscription": {
+                "active": sub_active,
+                "plan_type": sub_plan,
+                "status": sub_status,
+                "start_date": sub_start.isoformat() if sub_start else None,
+                "end_date": sub_end.isoformat() if sub_end else None,
+            },
         }, 200
 
 class DeleteUser(Resource):
