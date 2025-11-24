@@ -211,20 +211,6 @@ class IntaSendWebhook(Resource):
         )
 
         # after enqueue_ok is True in IntaSendWebhook.post
-        try:
-            from services.intasend_webhook_processor import process_intasend_webhook
-            logger.info("[Webhook] debug-run processor for tx_id=%s", tx.id)
-            process_intasend_webhook(
-                tx_id=tx.id,
-                checkout_id=checkout_id or tx.api_ref,
-                invoice_id=invoice_id,
-                raw_state=raw_state,
-                paid_flag=paid_flag,
-                payload=payload,
-            )
-        except Exception as e:
-            logger.exception("[Webhook] debug-run failed: %s", e)
-
 
         if not enqueue_ok:
             logger.error("[Webhook] queue full, cannot enqueue tx_id=%s", tx.id)
