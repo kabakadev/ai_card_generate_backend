@@ -221,6 +221,10 @@ class BillingStatus(Resource):
         if user_id is None:
             return {"error": "invalid token payload"}, 401
 
+        # CRITICAL FIX: Clear SQLAlchemy cache before querying
+        db.session.expire_all()
+        db.session.commit()  # Ensure any pending writes are flushed
+
         user = User.query.get(user_id)
         if not user:
             return {"error": "user not found"}, 404
