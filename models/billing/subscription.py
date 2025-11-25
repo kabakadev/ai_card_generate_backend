@@ -42,8 +42,8 @@ class Subscription(db.Model):
         server_default="pending",
     )
 
-    start_date = db.Column(db.DateTime, nullable=True)
-    end_date = db.Column(db.DateTime, nullable=True)
+    start_date = db.Column(db.DateTime(timezone=True), nullable=True)
+    end_date = db.Column(db.DateTime(timezone=True), nullable=True)
 
     amount = db.Column(db.Integer, nullable=False, server_default="100")
     currency = db.Column(db.String(3), nullable=False, server_default="KES")
