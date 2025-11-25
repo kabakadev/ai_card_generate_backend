@@ -11,7 +11,7 @@ from flask_jwt_extended import jwt_required, get_jwt_identity
 from config import limiter
 from models import PaymentTransaction
 from services.payment_utils import resolve_transaction
-from services.background_jobs import enqueue_intasend_webhook_job
+
 
 logger = logging.getLogger(__name__)
 
@@ -200,23 +200,26 @@ class IntaSendWebhook(Resource):
             # (Optional: persist raw payload for reconciliation)
             return {"status": "accepted"}, 202
 
-        # --- Enqueue processing (even if state is PENDING/PROCESSING) ---
-        enqueue_ok = enqueue_intasend_webhook_job(
-            tx_id=tx.id,
-            checkout_id=checkout_id or tx.api_ref,
-            invoice_id=invoice_id,
-            raw_state=raw_state,
-            paid_flag=paid_flag,
-            payload=payload,
-        )
-
-        # after enqueue_ok is True in IntaSendWebhook.post
-
-        if not enqueue_ok:
-            logger.error("[Webhook] queue full, cannot enqueue tx_id=%s", tx.id)
-            return {"error": "queue_full"}, 503
-
-        return {"status": "processing", "tx_id": tx.id}, 200
+        # Process webhooks synchronously (simpler & more reliable than background jobs)
+        try:
+            from services.intasend_webhook_processor import process_intasend_webhook
+            logger.info("[Webhook] SYNC processing tx_id=%s", tx.id)
+            
+            process_intasend_webhook(
+                tx_id=tx.id,
+                checkout_id=checkout_id or tx.api_ref,
+                invoice_id=invoice_id,
+                raw_state=raw_state,
+                paid_flag=paid_flag,
+                payload=payload,
+            )
+            
+            return {"status": "processed", "tx_id": tx.id}, 200
+            
+        except Exception as e:
+            logger.exception("[Webhook] SYNC processing FAILED tx_id=%s: %s", tx.id, e)
+            # Return 500 so IntaSend retries
+            return {"error": "processing_failed", "detail": str(e)}, 500
 
 
 class IntaSendWebhookStatus(Resource):
