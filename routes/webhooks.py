@@ -8,7 +8,7 @@ from flask import request, current_app
 from flask_restful import Resource
 from flask_jwt_extended import jwt_required, get_jwt_identity
 
-from config import limiter
+from config import db, limiter
 from models import PaymentTransaction
 from services.payment_utils import resolve_transaction
 
@@ -213,11 +213,18 @@ class IntaSendWebhook(Resource):
                 paid_flag=paid_flag,
                 payload=payload,
             )
+
+            # CRITICAL: Commit the transaction to make it permanent
+            db.session.commit()
             
             return {"status": "processed", "tx_id": tx.id}, 200
             
         except Exception as e:
             logger.exception("[Webhook] SYNC processing FAILED tx_id=%s: %s", tx.id, e)
+            
+            # Rollback in case of error
+            db.session.rollback()
+
             # Return 500 so IntaSend retries
             return {"error": "processing_failed", "detail": str(e)}, 500
 
