@@ -6,7 +6,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 # Import configuration and extensions
 from config import app, db, api
-from services.background_jobs import init_background_workers
+
 
 logger = logging.getLogger(__name__)
 
@@ -253,7 +253,7 @@ def create_app():
     register_core_routes()
     register_routes()
     register_error_handlers()
-    init_background_workers(app)
+
 
     logger.info("FlashLearn API application initialized successfully")
     return app
